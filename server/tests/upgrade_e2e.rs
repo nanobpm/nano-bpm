@@ -969,6 +969,58 @@ fn assert_latch_ordering(c: &Cluster, barrier: &[u64]) {
     }
 }
 
+/// Makes a phase's workload deterministic (#2065): keeps creating instances
+/// (through every member in turn, so routing and leadership timing cannot
+/// starve a partition) until `covered(member data dir, partition)` holds for
+/// EVERY member and EVERY partition, as read from the on-disk Raft logs.
+/// `covered` also receives that member's locally applied index for the
+/// partition (from `/debug/raft`): appending precedes applying, so a predicate
+/// must only count entries at or below it — log presence alone would let a
+/// follower pass before it has applied the item. A member that does not
+/// answer counts as not covered. Bounded by a timeout. The vacuity guards in [`assert_latch_ordering`] and
+/// [`assert_digest_cutover_agreed`] stay as they are and now hold by
+/// construction instead of by routing luck.
+fn drive_until_covered(
+    c: &mut Cluster,
+    keys: &mut Vec<String>,
+    what: &str,
+    covered: impl Fn(&Path, u64, u64) -> bool,
+) {
+    let all = |c: &Cluster| {
+        c.members.iter().enumerate().all(|(id, m)| {
+            let Some(status) = raft_status(c, id) else {
+                return false;
+            };
+            (0..PARTITIONS).all(|p| {
+                u64::try_from(status[p as usize].1)
+                    .is_ok_and(|applied| covered(&m.data, p, applied))
+            })
+        })
+    };
+    let deadline = Instant::now() + Duration::from_secs(180);
+    let mut via = 0;
+    while !all(c) {
+        assert!(
+            Instant::now() < deadline,
+            "{what} did not reach every partition on every member\n{}",
+            tail(&c.all_logs())
+        );
+        keys.extend(create_instances(c, via, 2));
+        via = (via + 1) % NODES;
+        // Wait until the new instances are applied everywhere, so the check
+        // reads every member's settled log rather than a lagging one.
+        assert_visible_everywhere(c, keys);
+        // Every blocking step inside a round is itself bounded (60 s), so a
+        // round always returns; re-checking here makes the phase budget a hard
+        // limit, so a slow round that overshoots it fails rather than passes.
+        assert!(
+            Instant::now() < deadline,
+            "{what} exceeded its 180 s budget\n{}",
+            tail(&c.all_logs())
+        );
+    }
+}
+
 /// The whole latch contract in one rolling-upgrade lifecycle (bounded: three
 /// small batches of instances, one member swap at a time).
 #[test]
@@ -996,6 +1048,17 @@ fn capability_latch_survives_a_real_mixed_binary_rolling_upgrade() {
     // old member was present. Log indices, not clock stamps, order this.
     let mut barrier = vec![0u64; PARTITIONS as usize];
     for id in 0..NODES {
+        if id + 1 == NODES {
+            // Pre-latch side: every member holds a locally
+            // APPLIED item on every partition before the barrier is taken
+            // (so its index is <= the barrier).
+            drive_until_covered(
+                &mut c,
+                &mut keys,
+                "the pre-latch workload",
+                |d, p, applied| raft_items(d, p).iter().any(|i| i.index <= applied),
+            );
+        }
         c.kill(id);
         if id + 1 == NODES {
             for (p, b) in barrier.iter_mut().enumerate() {
@@ -1035,6 +1098,22 @@ fn capability_latch_survives_a_real_mixed_binary_rolling_upgrade() {
     // envelope, which records the latch.
     keys.extend(create_instances(&c, 0, 6));
     assert_visible_everywhere(&mut c, &keys);
+    // Post-latch side: every member holds, on every partition, a stamped
+    // (latched) item and a post-barrier batch carrying a digest claim.
+    drive_until_covered(
+        &mut c,
+        &mut keys,
+        "the post-latch workload",
+        |d, p, applied| {
+            let after = barrier[p as usize];
+            raft_items(d, p)
+                .iter()
+                .any(|i| i.stamped && i.index <= applied)
+                && raft_batches(d, p)
+                    .iter()
+                    .any(|(i, b)| *i > after && *i <= applied && !b["digest"].is_null())
+        },
+    );
     c.assert_no_divergence("after the latch");
     assert_digest_cutover_agreed(&c, &barrier);
 
