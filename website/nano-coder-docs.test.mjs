@@ -203,3 +203,12 @@ test("colliding headings get unique ids across levels, and the TOC targets them"
   const tocIds = [...toc.matchAll(/href="#([^"]+)"/g)].map((m) => m[1]);
   assert.deepEqual(tocIds, ["web-tools", "fetch", "built-in-tools-1", "fetch-1"]);
 });
+
+test("HTML comments are stripped from prose but kept in code (generated-block markers)", () => {
+  const html = page("nano-coder/docs/cli/");
+  const content = html.slice(html.indexOf('<main'));
+  assert.doesNotMatch(content, /GENERATED:flags|contributor note|&lt;!-- GENERATED/);
+  assert.match(content, /Use <code>--model<\/code> to pick a model\./);
+  assert.match(content, /<code>&lt;!-- keep-inline --&gt;<\/code>/);
+  assert.match(content, /&lt;!-- keep-fenced --&gt;/);
+});

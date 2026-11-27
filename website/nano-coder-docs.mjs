@@ -174,6 +174,57 @@ function escapesRoot(base, path) {
 // --- Rendering -------------------------------------------------------------------
 
 /** H2/H3 headings of a rendered token stream, for the on-page TOC. */
+// Strip HTML comments (generated-block markers, contributor notes) from prose
+// before rendering: the shared renderer runs with `html: false`, so a comment
+// would otherwise be published as visible text. Fenced code blocks and inline
+// code spans are left verbatim, so a literal `<!-- -->` in an example survives.
+export function stripDocComments(body) {
+  const out = [];
+  let fence = null; // { ch, len } of the open fence
+  let inComment = false;
+  for (const line of body.split("\n")) {
+    if (!inComment) {
+      const f = /^ {0,3}(`{3,}|~{3,})/.exec(line);
+      if (fence) {
+        if (f && f[1][0] === fence.ch && f[1].length >= fence.len && /^ {0,3}[`~]+\s*$/.test(line)) fence = null;
+        out.push(line);
+        continue;
+      }
+      if (f) {
+        fence = { ch: f[1][0], len: f[1].length };
+        out.push(line);
+        continue;
+      }
+    }
+    let res = "";
+    let i = 0;
+    while (i < line.length) {
+      if (inComment) {
+        const end = line.indexOf("-->", i);
+        if (end < 0) { i = line.length; break; }
+        inComment = false;
+        i = end + 3;
+        continue;
+      }
+      if (line[i] === "`") {
+        let n = 1;
+        while (line[i + n] === "`") n++;
+        const tick = "`".repeat(n);
+        let j = line.indexOf(tick, i + n);
+        while (j >= 0 && line[j + n] === "`") j = line.indexOf(tick, j + n + 1);
+        if (j >= 0) { res += line.slice(i, j + n); i = j + n; continue; }
+        res += tick; i += n; continue;
+      }
+      if (line.startsWith("<!--", i)) { inComment = true; i += 4; continue; }
+      res += line[i]; i++;
+    }
+    // Drop lines that held only a comment, so markers don't leave blank gaps.
+    if (res.trim() === "" && line.trim() !== "") continue;
+    out.push(res);
+  }
+  return out.join("\n");
+}
+
 function tocFromTokens(tokens) {
   const toc = [];
   for (let i = 0; i < tokens.length; i++) {
@@ -225,7 +276,7 @@ function sidebarHtml(sections, activeRoute) {
 
 function pageHtml(page, ctx, md) {
   const env = { fromPath: page.path };
-  const tokens = md.parse(page.body, env);
+  const tokens = md.parse(stripDocComments(page.body), env);
   const toc = tocFromTokens(tokens);
   // Visible "#" anchor on each H2/H3 (heading ids are set by the shared renderer).
   let body = md.renderer.render(tokens, md.options, env);
