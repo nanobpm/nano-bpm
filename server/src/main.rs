@@ -4066,6 +4066,11 @@ impl ServerImpl {
         // activation is leader-local and so needs the digest to cover failover).
         let lease_digest = activation_policy.broadcasts_lease_digest();
         for journal in journals.iter_mut() {
+            // #2054: mark a Raft journal replicated BEFORE any envelope setter or
+            // local command (demo seed, lenient reconcile) runs, independently of
+            // the optional spill / lean-snapshot setup, so the capability
+            // envelopes can only ever be armed inside a Raft entry.
+            journal.set_replicated_apply(raft_enabled());
             journal.set_num_partitions(topology.num_partitions);
             // Leader-local activation (any policy that can lock leader-only) needs
             // lenient completion: a completion for a job whose (unreplicated) lock
@@ -7850,6 +7855,30 @@ struct SpillConfig {
     cold: Option<(u64, u64)>,
 }
 
+/// Which clock-tick body a node runs (#2054).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TickPath {
+    /// Tick-driven mutations are proposed through each LED partition's Raft
+    /// log; a node that leads nothing (e.g. mid-bootstrap, registry still
+    /// empty) fires no timer and expires no lease.
+    Raft,
+    /// The direct local tick of a non-replicated deployment.
+    Local,
+}
+
+/// The tick dispatch decision (#2054): keyed on the node's replication MODE
+/// only. Whether its Raft registry is populated yet is deliberately NOT an
+/// input — mid-bootstrap a Raft node's registry is empty, and taking the
+/// local path there fired timers and journaled capability latches outside
+/// the log, diverging its chain digest from its peers'.
+fn tick_path(raft_replicated: bool) -> TickPath {
+    if raft_replicated {
+        TickPath::Raft
+    } else {
+        TickPath::Local
+    }
+}
+
 impl SpillConfig {
     /// Installs the configured spill tiers onto `journal`. Idempotent per
     /// journal; call once per engine actor at construction.
@@ -7859,7 +7888,10 @@ impl SpillConfig {
         // incident inline — they are handed to the leader-propose channel the
         // replication layer wires (`set_orphan_sink`) so the leader re-proposes
         // them with a replicated timestamp.
-        journal.set_replicated_apply(raft_enabled());
+        // #2054: monotonic — never DOWNGRADE a journal a caller already marked
+        // replicated (e.g. a Raft replica built without `NANOBPMN_RAFT`), or
+        // spill setup would re-enable out-of-entry capability arming.
+        journal.set_replicated_apply(journal.replicated_apply() || raft_enabled());
         if let Some(cfg) = &self.var {
             match cfg {
                 VarSpillCfg::Budget(budget) => {
@@ -22193,6 +22225,9 @@ impl ServerImpl {
             return None;
         };
         let mut journal = Journal::in_memory_partition(p);
+        // #2054: a replica engine only ever exists under Raft, so it is always a
+        // replicated-apply journal — regardless of whether spill is configured.
+        journal.set_replicated_apply(true);
         journal.set_num_partitions(self.engine.topology().num_partitions);
         // The REPLICATED lenient flag is not configured here (#1661): this
         // replica learns it from the Raft log / snapshot at exactly the index
@@ -23192,6 +23227,131 @@ impl ServerImpl {
             .collect();
         self.trace_store
             .record_activations(&acts, worker, now_millis());
+    }
+
+    /// One clock-tick sweep over this node's partitions along `path` (see
+    /// [`tick_path`]), returning each partition's `(produced, routable)`.
+    /// The background tick loop is a thin driver around this, so the dispatch
+    /// is testable without spawning the loop (#2054).
+    async fn clock_tick(
+        &self,
+        path: TickPath,
+        now: u64,
+        multi_partition: bool,
+    ) -> Vec<(bool, Vec<Event>)> {
+        if path == TickPath::Raft {
+            let led = self.led_partitions();
+            // Reclaim hot RAM on the partitions this node FOLLOWS (hosts a
+            // replica of but does not currently lead). The leader spills its
+            // led partitions inside `tick_partition_via_raft`'s precheck, but
+            // a follower never proposes, so its replica engine would never run
+            // the spill gate and would pin the entire replicated working set
+            // resident — the leader/follower memory imbalance. Spill is a
+            // pure-local memory op (no key mint, no events, no proposal), so it
+            // is safe on any replica; a later replicated command rehydrates a
+            // cold instance on demand. Fan out concurrently, off the led path.
+            let led_set: std::collections::HashSet<u64> = led.iter().copied().collect();
+            let followed: Vec<u64> = (0..self.engine.topology().num_partitions)
+                .filter(|p| !led_set.contains(p))
+                .collect();
+            futures_util::future::join_all(followed.into_iter().filter_map(|p| {
+                self.engine_handle_for(p).map(|handle| async move {
+                    handle
+                        .with(|journal| {
+                            journal.maybe_var_spill_pressure();
+                            journal.maybe_cold_spill();
+                        })
+                        .await;
+                })
+            }))
+            .await;
+            // Keep the outbound-dial feature requirement in step with
+            // replicated state on EVERY node (#1661) — leader or
+            // follower — so no link opens to an older binary once the
+            // log carries an entry it cannot decode. One-way, so a
+            // single cheap check per tick after it first fires.
+            let _required = self.required_cluster_features().await;
+            futures_util::future::join_all(
+                led.iter()
+                    .map(|&p| self.tick_partition_via_raft(p, now, multi_partition)),
+            )
+            .await
+        } else {
+            // Only a genuinely single-node deployment may journal the
+            // irreversible flag locally (#1661): an empty Raft registry
+            // is also what a multi-node node looks like mid-bootstrap,
+            // and a multi-node non-Raft deployment has no compatibility
+            // gate here — both keep the legacy host flag instead.
+            let lenient = local_lenient_reconcile(self.engine.topology(), self.activation_policy);
+            let remote_delivery =
+                remote_buffered_delivery_gate(self.engine.topology(), &self.peers).await;
+            let ack_v2 = cluster_feature_gate(
+                self.engine.topology(),
+                &self.peers,
+                nano_falcon_protocol::cluster_join::FEATURE_MESSAGE_CORRELATION_ACK_V2,
+            )
+            .await;
+            let gateway_runtime =
+                event_gateway_runtime_gate(self.engine.topology(), &self.peers).await;
+            futures_util::future::join_all(self.engine.all().iter().map(|handle| {
+                handle.with(move |journal| {
+                    // Without Raft this journal is the partition's only
+                    // replica: reconcile the lenient flag directly (#1661).
+                    reconcile_lenient_completion_local(journal, lenient, now);
+                    // The cluster-wide #1949 / #2037 capability gates
+                    // (ADR 0066).
+                    journal.set_remote_buffered_delivery(remote_delivery);
+                    // The cluster-wide #2004 capability gate.
+                    journal.set_event_gateway_runtime(gateway_runtime);
+                    journal.set_message_correlation_ack_v2(ack_v2);
+                    let (fired, commit) = journal.trigger_timers(now);
+                    // Fire-and-forget tick: nothing reads disk after it and
+                    // follow-ups are re-derived from engine state (#1855).
+                    commit.detach();
+                    #[allow(
+                        clippy::expect_used,
+                        reason = "invariant by construction: ExpireJobsByDurability is an internal timer-driven command that cannot be rejected"
+                    )]
+                    let (leased_expired, lease_commit) = journal
+                        .apply_command_at(
+                            Command::ExpireJobsByDurability { now, durable: true },
+                            now,
+                        )
+                        .expect("expiry cannot reject");
+                    lease_commit.detach();
+                    let expired = journal.expire_jobs(now);
+                    // Shed to disk if hot RAM is over the high-water mark
+                    // (cheap no-op below it / when unset): active-backlog
+                    // variables first, then whole dormant instances.
+                    journal.maybe_var_spill_pressure();
+                    journal.maybe_cold_spill();
+                    // A fired timer may advance a token into an off-partition
+                    // message catch: surface those follow-ups for routing.
+                    let routable: Vec<Event> = if multi_partition {
+                        fired
+                            .iter()
+                            .filter(|e| {
+                                e.is_routable()
+                            })
+                            .cloned()
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
+                    // Either a fired timer (may create a job) or a reclaimed
+                    // job lease (frees a job for redelivery) means there is
+                    // pushable work — wake dispatch instead of waiting for
+                    // its own backstop tick.
+                    (
+                        !fired.is_empty()
+                            || !expired.is_empty()
+                            || !leased_expired.is_empty(),
+                        routable,
+                    )
+                })
+            }))
+            .await
+        }
     }
 
     /// The Raft clock tick for partition `p`: when this node leads `p`, replicate
@@ -28956,6 +29116,138 @@ fn health_response(report: &snapshot_health::HealthReport) -> Response {
 }
 
 // ---------------------------------------------------------------------------
+/// `POST /debug/journal-snapshot` (#2058): forces one tick of the clustered
+/// multi-partition journal snapshot/compaction loop and answers with the
+/// per-partition boundary the durable combined snapshot now covers, one
+/// `partition=<p> snapshot_index=<n>` line each. Lets the upgrade harness take a
+/// deterministic snapshot checkpoint before a restart and then prove the restart
+/// restored exactly that snapshot (see [`seglog::RECOVERED_PARTITION`]).
+mod journal_snapshot_trigger {
+    use std::sync::OnceLock;
+
+    use tokio::sync::{mpsc, oneshot};
+
+    /// Message of the per-partition line every successful tick logs.
+    pub(crate) const WRITTEN: &str = "journal snapshot written";
+
+    pub(crate) type Reply = oneshot::Sender<Vec<(u64, u64)>>;
+
+    static TX: OnceLock<mpsc::Sender<Reply>> = OnceLock::new();
+
+    /// Opt-in switch: the forced-snapshot endpoint is a test/operator hook that
+    /// bypasses the maintenance interval, so it is OFF unless the process is
+    /// started with `NANOBPMN_DEBUG_JOURNAL_SNAPSHOT=1`.
+    pub(crate) const ENABLE_ENV: &str = "NANOBPMN_DEBUG_JOURNAL_SNAPSHOT";
+
+    /// Whether `value` (the [`ENABLE_ENV`] value) enables the endpoint. Only an
+    /// explicit `1`/`true` opts in; anything else (unset included) fails closed.
+    pub(crate) fn enabled_by(value: Option<&str>) -> bool {
+        matches!(value.map(str::trim), Some("1") | Some("true"))
+    }
+
+    pub(crate) fn enabled() -> bool {
+        enabled_by(std::env::var(ENABLE_ENV).ok().as_deref())
+    }
+
+    /// The maintenance loop's end of the trigger channel. `None` when the
+    /// endpoint is disabled or already taken (one loop per process).
+    pub(crate) fn receiver() -> Option<mpsc::Receiver<Reply>> {
+        if !enabled() {
+            return None;
+        }
+        let (tx, rx) = mpsc::channel(1);
+        TX.set(tx).ok().map(|()| rx)
+    }
+
+    /// Outcome of one forced-tick request.
+    #[derive(Debug, PartialEq, Eq)]
+    pub(crate) enum Trigger {
+        Covered(Vec<(u64, u64)>),
+        /// A forced tick is already queued: bounded admission, no waiting.
+        Busy,
+        /// No loop runs here, or the tick failed.
+        Unavailable,
+    }
+
+    /// Admits at most one queued forced tick: a second request while one is
+    /// pending is refused immediately (never parked waiting to send).
+    pub(crate) async fn trigger_on(tx: Option<&mpsc::Sender<Reply>>) -> Trigger {
+        let Some(tx) = tx else {
+            return Trigger::Unavailable;
+        };
+        let (reply, done) = oneshot::channel();
+        match tx.try_send(reply) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => return Trigger::Busy,
+            Err(mpsc::error::TrySendError::Closed(_)) => return Trigger::Unavailable,
+        }
+        match done.await {
+            Ok(covered) => Trigger::Covered(covered),
+            Err(_) => Trigger::Unavailable,
+        }
+    }
+
+    pub(crate) async fn route() -> axum::response::Response {
+        use axum::response::IntoResponse;
+        match trigger_on(TX.get()).await {
+            Trigger::Covered(covered) => covered
+                .iter()
+                .map(|(p, c)| format!("partition={p} snapshot_index={c}\n"))
+                .collect::<String>()
+                .into_response(),
+            Trigger::Busy => (
+                axum::http::StatusCode::TOO_MANY_REQUESTS,
+                "a forced journal snapshot is already pending\n",
+            )
+                .into_response(),
+            Trigger::Unavailable => (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "journal snapshot unavailable (no segmented multi-partition journal, or the tick failed)\n",
+            )
+                .into_response(),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn disabled_unless_explicitly_opted_in() {
+            assert!(!enabled_by(None));
+            for v in ["", "0", "false", "yes", "TRUE1"] {
+                assert!(!enabled_by(Some(v)), "{v:?} must not enable");
+            }
+            assert!(enabled_by(Some("1")));
+            assert!(enabled_by(Some("true")));
+        }
+
+        #[tokio::test]
+        async fn no_loop_is_unavailable() {
+            assert_eq!(trigger_on(None).await, Trigger::Unavailable);
+        }
+
+        #[tokio::test]
+        async fn second_pending_request_is_refused_not_parked() {
+            let (tx, mut rx) = mpsc::channel::<Reply>(1);
+            let (first, _done) = oneshot::channel();
+            tx.try_send(first).unwrap();
+            assert_eq!(trigger_on(Some(&tx)).await, Trigger::Busy);
+            let pending = rx.recv().await.unwrap();
+            let t = tokio::spawn({
+                let tx = tx.clone();
+                async move { trigger_on(Some(&tx)).await }
+            });
+            let reply = rx.recv().await.unwrap();
+            reply.send(vec![(0, 7)]).unwrap();
+            assert_eq!(t.await.unwrap(), Trigger::Covered(vec![(0, 7)]));
+            drop(pending);
+            drop(rx);
+            assert_eq!(trigger_on(Some(&tx)).await, Trigger::Unavailable);
+        }
+    }
+}
+
 // #1386 — admin tooling for snapshot blockers (follow-up to #1383).
 //
 // #1383 showed a single orphaned spilled instance could fail-close every
@@ -31457,8 +31749,20 @@ async fn main() {
                     // retaining the latest generation as the replay-migration
                     // fallback (#1071).
                     let mut prev_floor: u64 = 0;
+                    // `POST /debug/journal-snapshot` (#2058): an operator/test
+                    // forced tick, answered with the covered boundaries once the
+                    // combined snapshot is durable (dropped on a failed tick).
+                    let mut forced = journal_snapshot_trigger::receiver();
                     loop {
-                        ticker.tick().await;
+                        let reply = tokio::select! {
+                            _ = ticker.tick() => None,
+                            Some(reply) = async {
+                                match forced.as_mut() {
+                                    Some(rx) => rx.recv().await,
+                                    None => std::future::pending().await,
+                                }
+                            } => Some(reply),
+                        };
                         // Serialize this capture -> publish cycle with a Raft
                         // snapshot adoption's base checkpoint (#1405): taken off
                         // the engine actor, held until the tick ends.
@@ -31564,11 +31868,12 @@ async fn main() {
                         // partitions a clustered node does not own, and its min
                         // would pin the floor at 0 forever (unbounded cold
                         // archive, #1076).
-                        let owned_covered: Vec<u64> = if varstore.is_some() {
-                            entries.iter().map(|e| e.1).collect()
+                        let owned_pairs: Vec<(u64, u64)> = if varstore.is_some() {
+                            entries.iter().map(|e| (e.0, e.1)).collect()
                         } else {
-                            stream_entries.iter().map(|e| e.1).collect()
+                            stream_entries.iter().map(|e| (e.0, e.1)).collect()
                         };
+                        let owned_covered: Vec<u64> = owned_pairs.iter().map(|e| e.1).collect();
                         // Lean path: control-only snapshots written inline (the
                         // authoritative var store holds the payloads, so a spilled
                         // placeholder is serialized as-is). Non-lean path (#1463):
@@ -31629,6 +31934,17 @@ async fn main() {
                         }
                         prev_floor = seglog::cold_prune_floor(&owned_covered);
                         record_snapshot_health_tick(health, &handles, &shared, Ok(())).await;
+                        for &(pid, covered_p) in &owned_pairs {
+                            tracing::info!(
+                                partition = pid,
+                                snapshot_index = covered_p,
+                                "{}",
+                                journal_snapshot_trigger::WRITTEN
+                            );
+                        }
+                        if let Some(reply) = reply {
+                            let _ = reply.send(owned_pairs);
+                        }
 
                         // Bound the durable var-store WAL: truncate it back to zero
                         // on its own cadence so a sustained write load can't grow it
@@ -31677,7 +31993,6 @@ async fn main() {
 
     // Capture handles for the background tick before `server` is moved into the
     // router.
-    let tick_engine = server.engine.clone();
     let tick_jobs_available = server.jobs_available.clone();
     let tick_dispatch_wake = server.dispatch_wake.clone();
     let idle_engine = server.engine.clone();
@@ -31956,6 +32271,10 @@ async fn main() {
             }),
         )
         .route(
+            "/debug/journal-snapshot",
+            axum::routing::post(journal_snapshot_trigger::route),
+        )
+        .route(
             "/debug/instances",
             axum::routing::get(move || {
                 let srv = dbg_server.clone();
@@ -32196,11 +32515,10 @@ async fn main() {
     // (journaled); lock expiry is volatile (not journaled). Wakes any long-polling
     // activateJobs when a tick produced events (a fired timer may create jobs).
     {
-        let engine = tick_engine;
         let jobs_available = tick_jobs_available;
         let dispatch_wake = tick_dispatch_wake;
         let tick_server = tick_server;
-        let multi_partition = engine.topology().num_partitions > 1;
+        let multi_partition = tick_server.engine.topology().num_partitions > 1;
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
             loop {
@@ -32216,128 +32534,19 @@ async fn main() {
                 // single `now` as client writes, so they go through the leader's
                 // Raft log (followers apply in lockstep). Non-Raft uses the direct
                 // local path below, byte-identical to the pre-cluster behaviour.
-                let outcomes: Vec<(bool, Vec<Event>)> = if !tick_server.raft.is_empty() {
-                    let led = tick_server.led_partitions();
-                    // Reclaim hot RAM on the partitions this node FOLLOWS (hosts a
-                    // replica of but does not currently lead). The leader spills its
-                    // led partitions inside `tick_partition_via_raft`'s precheck, but
-                    // a follower never proposes, so its replica engine would never run
-                    // the spill gate and would pin the entire replicated working set
-                    // resident — the leader/follower memory imbalance. Spill is a
-                    // pure-local memory op (no key mint, no events, no proposal), so it
-                    // is safe on any replica; a later replicated command rehydrates a
-                    // cold instance on demand. Fan out concurrently, off the led path.
-                    let led_set: std::collections::HashSet<u64> = led.iter().copied().collect();
-                    let followed: Vec<u64> = (0..tick_server.engine.topology().num_partitions)
-                        .filter(|p| !led_set.contains(p))
-                        .collect();
-                    futures_util::future::join_all(followed.into_iter().filter_map(|p| {
-                        tick_server.engine_handle_for(p).map(|handle| async move {
-                            handle
-                                .with(|journal| {
-                                    journal.maybe_var_spill_pressure();
-                                    journal.maybe_cold_spill();
-                                })
-                                .await;
-                        })
-                    }))
-                    .await;
-                    // Keep the outbound-dial feature requirement in step with
-                    // replicated state on EVERY node (#1661) — leader or
-                    // follower — so no link opens to an older binary once the
-                    // log carries an entry it cannot decode. One-way, so a
-                    // single cheap check per tick after it first fires.
-                    let _required = tick_server.required_cluster_features().await;
-                    futures_util::future::join_all(
-                        led.iter()
-                            .map(|&p| tick_server.tick_partition_via_raft(p, now, multi_partition)),
-                    )
-                    .await
-                } else {
-                    // Only a genuinely single-node deployment may journal the
-                    // irreversible flag locally (#1661): an empty Raft registry
-                    // is also what a multi-node node looks like mid-bootstrap,
-                    // and a multi-node non-Raft deployment has no compatibility
-                    // gate here — both keep the legacy host flag instead.
-                    let lenient = local_lenient_reconcile(
-                        tick_server.engine.topology(),
-                        tick_server.activation_policy,
-                    );
-                    let remote_delivery = remote_buffered_delivery_gate(
-                        tick_server.engine.topology(),
-                        &tick_server.peers,
+                //
+                // The mode is the node's replication MODE, not whether its Raft
+                // registry is populated yet (#2054): mid-bootstrap a Raft node's
+                // registry is still empty, and taking the local path there fired
+                // timers and journaled capability latches on a Raft replica
+                // OUTSIDE the log — diverging its chain digest from its peers'.
+                let outcomes = tick_server
+                    .clock_tick(
+                        tick_path(tick_server.raft_replicated()),
+                        now,
+                        multi_partition,
                     )
                     .await;
-                    let gateway_runtime = event_gateway_runtime_gate(
-                        tick_server.engine.topology(),
-                        &tick_server.peers,
-                    )
-                    .await;
-                    let ack_v2 = cluster_feature_gate(
-                        tick_server.engine.topology(),
-                        &tick_server.peers,
-                        nano_falcon_protocol::cluster_join::FEATURE_MESSAGE_CORRELATION_ACK_V2,
-                    )
-                    .await;
-                    futures_util::future::join_all(engine.all().iter().map(|handle| {
-                        handle.with(move |journal| {
-                            // Without Raft this journal is the partition's only
-                            // replica: reconcile the lenient flag directly (#1661).
-                            reconcile_lenient_completion_local(journal, lenient, now);
-                            // The cluster-wide #1949 / #2037 capability gates
-                            // (ADR 0066).
-                            journal.set_remote_buffered_delivery(remote_delivery);
-                            // The cluster-wide #2004 capability gate.
-                            journal.set_event_gateway_runtime(gateway_runtime);
-                            journal.set_message_correlation_ack_v2(ack_v2);
-                            let (fired, commit) = journal.trigger_timers(now);
-                            // Fire-and-forget tick: nothing reads disk after it and
-                            // follow-ups are re-derived from engine state (#1855).
-                            commit.detach();
-                            #[allow(
-                                clippy::expect_used,
-                                reason = "invariant by construction: ExpireJobsByDurability is an internal timer-driven command that cannot be rejected"
-                            )]
-                            let (leased_expired, lease_commit) = journal
-                                .apply_command_at(
-                                    Command::ExpireJobsByDurability { now, durable: true },
-                                    now,
-                                )
-                                .expect("expiry cannot reject");
-                            lease_commit.detach();
-                            let expired = journal.expire_jobs(now);
-                            // Shed to disk if hot RAM is over the high-water mark
-                            // (cheap no-op below it / when unset): active-backlog
-                            // variables first, then whole dormant instances.
-                            journal.maybe_var_spill_pressure();
-                            journal.maybe_cold_spill();
-                            // A fired timer may advance a token into an off-partition
-                            // message catch: surface those follow-ups for routing.
-                            let routable: Vec<Event> = if multi_partition {
-                                fired
-                                    .iter()
-                                    .filter(|e| {
-                                        e.is_routable()
-                                    })
-                                    .cloned()
-                                    .collect()
-                            } else {
-                                Vec::new()
-                            };
-                            // Either a fired timer (may create a job) or a reclaimed
-                            // job lease (frees a job for redelivery) means there is
-                            // pushable work — wake dispatch instead of waiting for
-                            // its own backstop tick.
-                            (
-                                !fired.is_empty()
-                                    || !expired.is_empty()
-                                    || !leased_expired.is_empty(),
-                                routable,
-                            )
-                        })
-                    }))
-                    .await
-                };
                 let mut produced = false;
                 let mut routable: Vec<Event> = Vec::new();
                 for (p, mut r) in outcomes {
@@ -34851,6 +35060,134 @@ mod clustered_startup_tests {
             .map(|p| Journal::in_memory_partition(*p))
             .collect();
         build_server_in_memory(journals, topology)
+    }
+
+    /// #2054: the tick dispatch is keyed on the replication MODE alone — a
+    /// Raft node whose registry is still empty (mid-bootstrap) must take the
+    /// Raft path, never the local one.
+    #[test]
+    fn tick_path_follows_replication_mode_not_registry() {
+        assert_eq!(tick_path(true), TickPath::Raft);
+        assert_eq!(tick_path(false), TickPath::Local);
+    }
+
+    /// Jobs currently held under an activation (lease) on `j`.
+    fn activated_jobs(j: &Journal) -> usize {
+        j.state()
+            .jobs
+            .values()
+            .filter(|job| job.state == nanobpmn_engine_core::JobState::Activated)
+            .count()
+    }
+
+    /// Seeds every owned partition of `node` with a due-able timer and a
+    /// durably-leased job (lease `lease_ms` from `now`), marking each journal
+    /// replicated-apply as a Raft node's startup does.
+    async fn seed_due_timer_and_lease(node: &ServerImpl, now: u64, lease_ms: u64) {
+        for handle in node.engine.all() {
+            handle
+                .with(move |j| {
+                    j.set_replicated_apply(true);
+                    let timed = ProcessBuilder::new("timed")
+                        .start_event("s")
+                        .timer_intermediate_catch_event("wait", 1)
+                        .end_event("e")
+                        .connect("s", "wait")
+                        .connect("wait", "e")
+                        .build()
+                        .expect("valid timer process");
+                    let leased = ProcessBuilder::new("leased")
+                        .start_event("s")
+                        .service_task("work", "leased-work")
+                        .end_event("e")
+                        .connect("s", "work")
+                        .connect("work", "e")
+                        .build()
+                        .expect("valid leased process");
+                    for cmd in [
+                        Command::DeployProcess(timed),
+                        Command::DeployProcess(leased),
+                        Command::create_instance("timed"),
+                        Command::create_instance("leased"),
+                        Command::ActivateJobs {
+                            job_type: "leased-work".into(),
+                            worker: "w".into(),
+                            max_jobs: 1,
+                            timeout: lease_ms,
+                            now,
+                            fetch_variables: Vec::new(),
+                            with_lease: true,
+                        },
+                    ] {
+                        j.apply_command_at(cmd, now).expect("seed").1.detach();
+                    }
+                })
+                .await;
+        }
+    }
+
+    /// #2054 red/green: a Raft-mode node ticked mid-bootstrap (EMPTY Raft
+    /// registry) through the real tick body with a due timer and an expired
+    /// durable lease journals NOTHING: the timer and lease are untouched and
+    /// no capability latch is recorded. The pre-fix dispatch
+    /// (`!raft.is_empty()`) took the local path here and fired them outside
+    /// the log. The local path over the same seed does fire (non-vacuity).
+    #[tokio::test]
+    async fn raft_tick_with_empty_registry_journals_nothing() {
+        let node = clustered_node(0);
+        assert!(
+            node.raft.is_empty(),
+            "mid-bootstrap: no Raft partition registered"
+        );
+        let t0 = 1_000_000;
+        seed_due_timer_and_lease(&node, t0, 10).await;
+        let later = t0 + 60_000;
+        let fingerprint = |node: &ServerImpl| {
+            let handles = node.engine.all().to_vec();
+            async move {
+                let mut out = Vec::new();
+                for h in handles {
+                    out.push(
+                        h.with(move |j| {
+                            assert!(j.has_due_timers(later), "seed armed a due timer");
+                            assert!(activated_jobs(j) > 0, "seed leased a job");
+                            assert!(!j.engine().message_correlation_ack_required());
+                            assert!(!j.engine().message_correlation_ack_v2_required());
+                            format!("{:?}", j.engine_snapshot())
+                        })
+                        .await,
+                    );
+                }
+                out
+            }
+        };
+        let before = fingerprint(&node).await;
+
+        let outcomes = node.clock_tick(TickPath::Raft, later, true).await;
+        assert!(
+            outcomes.iter().all(|(p, r)| !p && r.is_empty()),
+            "a Raft tick on an unregistered node must produce nothing: {outcomes:?}"
+        );
+        assert_eq!(
+            fingerprint(&node).await,
+            before,
+            "a Raft tick on an unregistered node journaled state outside the log"
+        );
+
+        // Non-vacuity: the local body over the same seed fires the timer and
+        // reclaims the lease.
+        let outcomes = node.clock_tick(TickPath::Local, later, true).await;
+        assert!(
+            outcomes.iter().any(|(p, _)| *p),
+            "the local tick fires the seed"
+        );
+        for h in node.engine.all() {
+            h.with(move |j| {
+                assert!(!j.has_due_timers(later));
+                assert_eq!(activated_jobs(j), 0, "the expired lease is reclaimed");
+            })
+            .await;
+        }
     }
 
     #[test]
@@ -48636,6 +48973,100 @@ mod clustered_startup_tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// #2054: once its partitions are registered, a Raft node's real tick
+    /// body (dispatched by [`tick_path`]) proposes through the Raft log: an
+    /// expired lease on the leader is reclaimed via the replicated path.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn registered_raft_node_ticks_through_the_raft_propose_path() {
+        let (node0, node1, node2) = boot_rf3_intake_cluster().await;
+        assert!(
+            node0.raft_replicated(),
+            "a registered Raft node is replicated"
+        );
+        let path = tick_path(node0.raft_replicated());
+        assert_eq!(path, TickPath::Raft);
+        node0
+            .create_for_stream(Some("intake".into()), None, Default::default())
+            .await
+            .expect("raft-routed create commits via quorum");
+        // A DURABLE lease (`with_lease = true`), so the lock is replicated
+        // state and its expiry can only reach followers through the Raft log —
+        // a volatile leader-local lock could expire locally and pass vacuously.
+        let mut job_key = None;
+        for _ in 0..200 {
+            let jobs = node0
+                .activate_for_stream_with_lease("do-work", "w", 10, 500, None, true)
+                .await;
+            if let Some(j) = jobs.into_iter().next() {
+                job_key = Some(j.job_key.0.parse::<u64>().expect("numeric job key"));
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let job_key = job_key.expect("the job leases on the leader");
+        assert!(
+            node0.led_partitions().contains(&0),
+            "node0 leads partition 0"
+        );
+        let follower_state = |node: &ServerImpl| {
+            let handle = node
+                .engine_handle_for(0)
+                .expect("follower materializes partition 0");
+            async move {
+                handle
+                    .with(move |journal| journal.engine().job(job_key).map(|j| j.state))
+                    .await
+            }
+        };
+        // The follower must observe the replicated activation before the tick.
+        let mut activated = false;
+        for _ in 0..200 {
+            if follower_state(&node1).await == Some(nanobpmn_engine_core::JobState::Activated) {
+                activated = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            activated,
+            "the follower observes the durable lease (Activated)"
+        );
+        let far_future = now_millis() + 600_000;
+        let mut produced = false;
+        for _ in 0..50 {
+            let outcomes = node0.clock_tick(path, far_future, true).await;
+            if outcomes.iter().any(|(p, _)| *p) {
+                produced = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            produced,
+            "the Raft tick reclaims the expired lease via the log"
+        );
+        // The expiry replicated: the follower sees the job back in Created.
+        let mut reclaimed = false;
+        for _ in 0..200 {
+            if follower_state(&node1).await == Some(nanobpmn_engine_core::JobState::Created) {
+                reclaimed = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            reclaimed,
+            "the follower observes the lease expiry replicated through Raft (Created)"
+        );
+        for node in [&node0, &node1, &node2] {
+            for p in 0..3u64 {
+                if let Some(part) = node.raft_registry().get(p) {
+                    part.raft.shutdown().await.ok();
+                }
+            }
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_job_leased_on_the_killed_leader_re_activates_on_the_new_leader() {
         // s3-test: at-least-once ACROSS failover. A job activated (leased) on the
@@ -51174,6 +51605,13 @@ mod clustered_startup_tests {
             !bare.with(|j| j.cold_spill_configured()).await,
             "no spill configured => replica has no cold store"
         );
+        // #2054: even without spill, a replica is a replicated-apply journal, so
+        // its capability envelopes can only be armed inside a Raft entry (the
+        // journal-level refusal is pinned in nano-server-storage's tests).
+        assert!(
+            bare.with(|j| j.replicated_apply()).await,
+            "a replica engine without spill must still be a replicated-apply journal"
+        );
 
         // Configure spill (in-memory store) as startup would, then a freshly
         // built replica engine must carry the cold tier.
@@ -51188,6 +51626,12 @@ mod clustered_startup_tests {
         assert!(
             replica.with(|j| j.cold_spill_configured()).await,
             "configured spill => replica engine inherits the cold store"
+        );
+        // #2054: spill setup must not downgrade the replica's replicated-apply
+        // mark (SpillConfig::apply runs after replica_engine_for marks it).
+        assert!(
+            replica.with(|j| j.replicated_apply()).await,
+            "a replica engine with spill configured must still be a replicated-apply journal"
         );
     }
 
@@ -63516,9 +63960,10 @@ mod no_direct_engine_apply_guard {
         // bare name. #1308.
         "apply_create_instance_direct",
         // The periodic timer tick drives led partitions through Raft
-        // (`tick_partition_via_raft`) and applies locally only when Raft is off.
-        // `main` is a free function, so it is keyed by its bare name.
-        "main",
+        // (`tick_partition_via_raft`) and applies locally only when Raft is off
+        // (`TickPath::Local`). The background loop in `main` is a thin driver
+        // around `ServerImpl::clock_tick` (#2054).
+        "ServerImpl::clock_tick",
         // Startup demo-process seed on a fresh deployment partition
         // (`journals[0].apply_command(Command::DeployProcess)`): runs once at
         // bootstrap before the node serves traffic, is re-derived from the
@@ -63764,7 +64209,6 @@ mod no_direct_engine_apply_guard {
         // exemption. Keep this set of bare-name free functions explicit so a new
         // *method* entry cannot silently slip in unscoped.
         const BARE_FREE_FNS: &[&str] = &[
-            "main",
             "apply_create_instance_direct",
             "reconcile_lenient_completion_local",
         ];

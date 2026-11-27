@@ -3079,6 +3079,13 @@ fn load_multi_snapshot_based(dir: &Path) -> io::Result<Option<(MultiEngines, Mul
     )))
 }
 
+/// Message of the structured per-partition line [`recover_multi`] logs once it
+/// has rebuilt an owned partition (#2058): fields `partition`, `snapshot_index`
+/// (the combined-snapshot boundary the engine was restored from; `0` for a full
+/// replay) and `replayed_entries` (journal tail events replayed on top). The
+/// upgrade harness asserts on it to prove a restart went snapshot + journal.
+pub const RECOVERED_PARTITION: &str = "journal partition recovered";
+
 /// The outcome of recovering a multi-partition segmented journal directory.
 pub struct MultiSegRecovery {
     /// `false` when prior durable state was recovered.
@@ -3495,6 +3502,9 @@ fn recover_multi_scoped_unchecked(
                 .map(|(_, e)| e.clone())
                 .collect();
             let base_p = pp_base.get(p as usize).copied().unwrap_or(0);
+            // (snapshot boundary the engine was rebuilt from, tail events replayed
+            // on top of it) — logged below as the observable recovery shape.
+            let shape: (u64, usize);
             let mut engine = if migrate {
                 let p_full: Vec<Event> = cold_tagged
                     .iter()
@@ -3503,6 +3513,7 @@ fn recover_multi_scoped_unchecked(
                     .map(|(_, e)| e.clone())
                     .collect();
                 verify_replayed_chain(None, &p_full, crate::digest::Coverage::Complete)?;
+                shape = (0, p_full.len());
                 Engine::replay_partition(p, p_full)
             } else {
                 match combined.as_ref().and_then(|m| m.get(&p)) {
@@ -3535,6 +3546,7 @@ fn recover_multi_scoped_unchecked(
                             }
                         }
                         let skip = covered.saturating_sub(base_p) as usize;
+                        shape = (*covered, p_events.len().saturating_sub(skip));
                         if skip < p_events.len() {
                             let seed = engine
                                 .raft_applied()
@@ -3554,10 +3566,17 @@ fn recover_multi_scoped_unchecked(
                     None => {
                         // `base_p == 0`: `p_events` is the partition's COMPLETE history.
                         verify_replayed_chain(None, &p_events, crate::digest::Coverage::Complete)?;
+                        shape = (0, p_events.len());
                         Engine::replay_partition(p, p_events)
                     }
                 }
             };
+            tracing::info!(
+                partition = p,
+                snapshot_index = shape.0,
+                replayed_entries = shape.1,
+                "{RECOVERED_PARTITION}"
+            );
             // Install partition-agnostic replicated deployments produced under
             // another partition (skips those this partition already replayed as
             // its own tagged events). Version-guarded so it is monotonic.
