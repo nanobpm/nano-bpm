@@ -10,9 +10,10 @@
 #   retried with exponential backoff (capped at 120 s), up to
 #   FETCH_PINNED_BUDGET_S seconds of wall-clock time per URL (default 300),
 #   request time included; each attempt's curl --max-time is bounded by the
-#   remaining budget (min 10 s, max 300 s). A numeric Retry-After is never
-#   shortened: if it exceeds the remaining budget the source is abandoned at
-#   once for the next mirror, otherwise it is slept in full. Any other
+#   remaining budget (max 300 s), and no request starts once the budget is
+#   spent. A numeric Retry-After (header name matched case-insensitively) is
+#   never shortened: if it leaves no budget for a further request the source
+#   is abandoned at once for the next mirror, otherwise it is slept in full. Any other
 #   status (e.g. 404) moves on to the next mirror. This is a retry of the
 #   FETCH of an immutable artifact, not a test retry.
 # - A download enters the cache only after it matches the pinned SHA-256, so
@@ -43,7 +44,10 @@ fetch_pinned() {
     start="$($clock)" delay=5
     while :; do
       elapsed=$(( $($clock) - start )); remaining=$(( budget - elapsed ))
-      maxt=$remaining; (( maxt > 300 )) && maxt=300; (( maxt < 10 )) && maxt=10
+      # Never start a request once the source's budget is spent (the backoff
+      # below only sleeps when time is left for at least one more request).
+      (( remaining < 1 )) && break
+      maxt=$remaining; (( maxt > 300 )) && maxt=300
       echo "$name: fetching $url"
       status="$(curl -sS -L --connect-timeout 20 --max-time "$maxt" -D "$hdr" -o "$tmp" -w '%{http_code}' "$url" 2>/dev/null)" || true
       status="${status:-000}"
@@ -62,10 +66,10 @@ fetch_pinned() {
         echo "$name: $url returned HTTP $status — trying next source" >&2
         break
       fi
-      ra="$(tr -d '\r' < "$hdr" 2>/dev/null | sed -n 's/^[Rr]etry-[Aa]fter:[[:space:]]*\([0-9][0-9]*\)[[:space:]]*$/\1/p' | tail -1)"
+      ra="$(tr -d '\r' < "$hdr" 2>/dev/null | tr '[:upper:]' '[:lower:]' | sed -n 's/^retry-after:[[:space:]]*\([0-9][0-9]*\)[[:space:]]*$/\1/p' | tail -1)"
       elapsed=$(( $($clock) - start )); remaining=$(( budget - elapsed ))
       if [[ -n "$ra" ]]; then
-        if (( ra > remaining )); then
+        if (( ra >= remaining )); then
           echo "$name: $url returned HTTP $status with Retry-After ${ra}s, beyond the ${remaining}s left of its budget — trying next source" >&2
           break
         fi
@@ -73,7 +77,7 @@ fetch_pinned() {
       else
         wait_s="$delay"
         (( wait_s > 120 )) && wait_s=120
-        if (( wait_s > remaining )); then
+        if (( wait_s >= remaining )); then
           echo "$name: $url still failing (HTTP $status) after ${elapsed}s — trying next source" >&2
           break
         fi

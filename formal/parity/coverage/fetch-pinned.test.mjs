@@ -22,14 +22,14 @@ function run(plan, { cached = false, corrupt = false, budget } = {}) {
   writeFileSync(curl, `#!/usr/bin/env bash
 n=$(cat "$STUB_DIR/n" 2>/dev/null || echo 0); n=$((n+1)); echo $n > "$STUB_DIR/n"
 echo "\${@: -1}" >> "$STUB_DIR/calls"
-read -r code ra cost < <(sed -n "\${n}p" "$STUB_DIR/plan")
+read -r code ra cost hname < <(sed -n "\${n}p" "$STUB_DIR/plan")
 [[ "$ra" == - ]] && ra=
 echo $(( $(cat "$STUB_DIR/clock" 2>/dev/null || echo 0) + \${cost:-0} )) > "$STUB_DIR/clock"
 while [[ $# -gt 0 ]]; do
   [[ "$1" == --max-time ]] && echo "$2" >> "$STUB_DIR/maxtimes"
   case "$1" in -D) hdr="$2"; shift;; -o) out="$2"; shift;; esac; shift
 done
-{ echo "HTTP/1.1 $code"; [[ -n "$ra" ]] && echo "Retry-After: $ra"; } | sed 's/$/\\r/' > "$hdr"
+{ echo "HTTP/1.1 $code"; [[ -n "$ra" ]] && echo "\${hname:-Retry-After}: $ra"; } | sed 's/$/\\r/' > "$hdr"
 if [[ "$code" == bad ]]; then printf bad > "$out"; printf 200; exit 0; fi
 [[ "$code" == 200 ]] && printf '${BODY}' > "$out"
 [[ "$code" == 000 ]] && exit 7
@@ -77,7 +77,7 @@ test('a 404 or exhausted backoff falls through to the mirror', () => {
   const r = run(['404', '200']);
   assert.equal(r.status, 0, r.stderr);
   assert.deepEqual(r.calls, ['https://one/a.jar', 'https://two/a.jar']);
-  const b = run(['429', '429', '200'], { budget: 5 });
+  const b = run(['429', '429', '200'], { budget: 6 });
   assert.equal(b.status, 0, b.stderr);
   assert.deepEqual(b.calls, ['https://one/a.jar', 'https://one/a.jar', 'https://two/a.jar']);
 });
@@ -106,4 +106,26 @@ test('the per-source budget counts request time, and bounds each attempt', () =>
   // elapsed before each attempt: 0, 105, 215 -> --max-time 300, 195, 85; the mirror starts afresh.
   assert.deepEqual(r.maxtimes, [300, 195, 85, 300]);
   assert.deepEqual(r.sleeps, [5, 10]);
+});
+
+test('Retry-After is matched case-insensitively', () => {
+  const r = run(['429 30 0 RETRY-AFTER', '503 7 0 retry-after', '200']);
+  assert.equal(r.status, 0, r.stderr);
+  assert.deepEqual(r.sleeps, [30, 7]);
+});
+
+test('no request is issued once the per-source budget is spent', () => {
+  // Retry-After equal to the remaining budget would leave 0s for the request: abandon instead.
+  const r = run(['429 100', '200'], { budget: 100 });
+  assert.equal(r.status, 0, r.stderr);
+  assert.deepEqual(r.sleeps, []);
+  assert.deepEqual(r.calls, ['https://one/a.jar', 'https://two/a.jar']);
+  // A request that eats the whole budget is never followed by another to the same source.
+  const b = run(['503 - 300', '200'], { budget: 300 });
+  assert.equal(b.status, 0, b.stderr);
+  assert.deepEqual(b.calls, ['https://one/a.jar', 'https://two/a.jar']);
+  // Every attempt's --max-time stays within what is left of the budget.
+  const c = run(['503 - 3', '503', '200'], { budget: 9 });
+  assert.equal(c.status, 0, c.stderr);
+  assert.deepEqual(c.maxtimes, [9, 1, 9]);
 });
