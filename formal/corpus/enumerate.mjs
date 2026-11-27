@@ -1152,7 +1152,16 @@ export function scenariosFor (graph, runs = exploreOrders(graph), { names = (o) 
         // its previous route).
         // (A suffix the start variables can still carry was already placed
         // there above; `cmdVars` holds only mid-run deliveries.)
-        if (Object.keys(cmdVars).length > 0) steps.push({ op: 'setVariables', variables: cmdVars })
+        //
+        // A route suffix still buffered for the first job completion (a
+        // message-first run that ticks before any job completes) rides this
+        // `setVariables` step too (#1990): a tick never completes a job, so
+        // without this the buffer is never delivered and the gateway reads an
+        // unset route (an incident, not a routing). A ticking scenario is
+        // nano-only (below), and nano's setVariables needs no job activation.
+        const tickVars = { ...pendingCompletionVars, ...cmdVars }
+        pendingCompletionVars = null
+        if (Object.keys(tickVars).length > 0) steps.push({ op: 'setVariables', variables: tickVars })
         steps.push({ op: 'advanceTime', ms: TIMER_TICK_MS })
         // The bare-gateway Camunda backend has NO timer-readiness barrier: its
         // create is in flight under awaitCompletion and a job completion's or
