@@ -87,6 +87,9 @@ test("version banner, SEO tags, TOC, heading anchors and copy buttons", () => {
   assert.match(tools, /<aside class="toc">[\s\S]*href="#web-tools"[\s\S]*class="l3" href="#fetch"/);
   assert.match(tools, /<h2 id="web-tools">Web tools<a class="anchor" href="#web-tools"/);
   assert.match(page("nano-coder/docs/"), /<pre><code class="language-sh">/);
+  // Keyboard users must see the permalink they tab to.
+  assert.match(tools, /\.anchor:focus-visible[^{]*\{ opacity: 1; \}/);
+
   assert.match(tools, /className = "copy-code"/);
   for (const r of ["nano-coder/docs/cli/", "nano-coder/docs/guides/deep/"]) assert.match(page(r), /Docs for nano-coder v1\.2\.3/);
 });
@@ -190,4 +193,13 @@ test("fetchLatestDocs removes its temp dir when the tarball fails to extract", a
   await assert.rejects(fetchLatestDocs({ env: {}, fetchImpl }));
   const leaked = readdirSync(tmpdir()).filter((n) => n.startsWith("nano-coder-docs-") && !before.has(n));
   assert.deepEqual(leaked, []);
+});
+
+test("colliding headings get unique ids across levels, and the TOC targets them", () => {
+  const tools = page("nano-coder/docs/tools/");
+  const ids = [...tools.matchAll(/<h[1-6] id="([^"]+)"/g)].map((m) => m[1]);
+  assert.deepEqual(ids, ["built-in-tools", "web-tools", "fetch", "built-in-tools-1", "fetch-1"]);
+  const toc = tools.match(/<aside class="toc">([\s\S]*?)<\/aside>/)[1];
+  const tocIds = [...toc.matchAll(/href="#([^"]+)"/g)].map((m) => m[1]);
+  assert.deepEqual(tocIds, ["web-tools", "fetch", "built-in-tools-1", "fetch-1"]);
 });

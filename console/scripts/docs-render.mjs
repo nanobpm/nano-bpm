@@ -51,6 +51,26 @@ export function repoRelative(base, path) {
 }
 
 /**
+ * Set a unique GitHub-style `id` on every `heading_open` token, in document
+ * order. A slug already taken gets the first free `-N` suffix (as GitHub does).
+ */
+export function assignHeadingIds(tokens) {
+  const used = new Set();
+  for (let i = 0; i < tokens.length; i++) {
+    const t = tokens[i];
+    if (t.type !== "heading_open") continue;
+    const inline = tokens[i + 1];
+    const text = inline && inline.type === "inline" ? inline.content : "";
+    const base = slugify(text.replace(/`/g, ""));
+    if (!base) continue;
+    let id = base;
+    for (let n = 1; used.has(id); n++) id = `${base}-${n}`;
+    used.add(id);
+    t.attrSet("id", id);
+  }
+}
+
+/**
  * Build a markdown-it instance with the shared docs rules:
  *  - GitHub-style `id`s on every heading (so in-page anchors resolve), and
  *  - link (`href`) and image (`src`) rewriting through the caller's hooks,
@@ -59,13 +79,12 @@ export function repoRelative(base, path) {
 export function createDocsMarkdown(MarkdownIt, { rewriteHref, rewriteSrc } = {}) {
   const md = new MarkdownIt({ html: false, linkify: true, breaks: false });
 
-  md.renderer.rules.heading_open = (tokens, idx, options, _env, self) => {
-    const inline = tokens[idx + 1];
-    const text = inline && inline.type === "inline" ? inline.content : "";
-    const id = slugify(text.replace(/`/g, ""));
-    if (id) tokens[idx].attrSet("id", id);
-    return self.renderToken(tokens, idx, options);
-  };
+  // Heading ids are assigned once per document at parse time (a core rule), so
+  // every consumer — the renderer and any TOC built from `md.parse` tokens —
+  // reads the same unique id from the token (`attrGet("id")`) instead of
+  // re-deriving a slug. Duplicates get GitHub's `-1`, `-2`… suffixes across
+  // ALL heading levels, so no two headings share an id.
+  md.core.ruler.push("docs_heading_ids", (state) => assignHeadingIds(state.tokens));
 
   if (rewriteHref) {
     const defaultLinkOpen =

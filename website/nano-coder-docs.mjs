@@ -43,7 +43,6 @@ import {
   escAttr,
   isExternalHref,
   repoRelative,
-  slugify,
 } from "../console/scripts/docs-render.mjs";
 
 export const NANO_CODER_REPO = "nanobpm/nano-coder";
@@ -182,9 +181,9 @@ function tocFromTokens(tokens) {
     if (t.type !== "heading_open" || (t.tag !== "h2" && t.tag !== "h3")) continue;
     const inline = tokens[i + 1];
     if (!inline || inline.type !== "inline") continue;
-    // Same id the shared renderer's heading_open rule assigns at render time.
+    // The unique id the shared renderer's core rule assigned at parse time.
     const text = inline.content.replace(/`/g, "");
-    const id = slugify(text);
+    const id = t.attrGet("id");
     if (id) toc.push({ level: t.tag === "h2" ? 2 : 3, id, text });
   }
   return toc;
@@ -205,7 +204,8 @@ const LAYOUT_CSS = `
       .toc a.l3 { padding-left: 0.8rem; }
       .content h2 .anchor, .content h3 .anchor { margin-left: 0.4rem; color: var(--muted);
         opacity: 0; text-decoration: none; font-weight: 400; }
-      .content h2:hover .anchor, .content h3:hover .anchor { opacity: 1; }
+      .content h2:hover .anchor, .content h3:hover .anchor,
+      .content .anchor:focus, .content .anchor:focus-visible { opacity: 1; }
       @media (max-width: 1100px) { .toc { display: none; } }`;
 
 function sidebarHtml(sections, activeRoute) {
