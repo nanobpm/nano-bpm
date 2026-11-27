@@ -1,0 +1,7 @@
+{
+  "description": "An event-based gateway waits on gateway-owned message/timer/signal subscriptions; the PT1M timer wins: the gateway completes, onTimer is activated directly (no gateway->catch flow taken), the message subscription is deleted and the losers are never activated (#1963).",
+  "steps": [
+    {"op": "createInstance", "bpmnProcessId": "evt-gateway-timer", "variables": {"orderId": "order-1"}},
+    {"op": "advanceClock", "millis": 60000}
+  ]
+}

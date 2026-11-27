@@ -1,0 +1,7 @@
+{
+  "description": "An event-based gateway waits on gateway-owned message/timer/signal subscriptions; the signal wins: the gateway completes, onSig is activated directly (no gateway->catch flow taken), the message subscription is deleted, the timer canceled and the losers are never activated (#1963).",
+  "steps": [
+    {"op": "createInstance", "bpmnProcessId": "evt-gateway-signal", "variables": {"orderId": "order-1"}},
+    {"op": "broadcastSignal", "name": "sig-go", "variables": {"paid": true}}
+  ]
+}

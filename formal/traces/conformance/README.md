@@ -154,5 +154,9 @@ check the projection and TLC acceptance on fixed Zeebe-shaped traces.
   and writes no `SEQUENCE_FLOW_TAKEN` for the gateway→catch flow. The spec
   vocabulary (`ZeebeTokenFlow.CorrelateEvent`'s documentation,
   `formal/corpus/spec-oracle.mjs`) previously claimed the selected flow was
-  taken. The matching Nano divergence (Nano takes every gateway→catch flow) is
-  https://github.com/nanobpm/nano-bpm/issues/1963.
+  taken. The matching Nano divergence (Nano took every gateway→catch flow,
+  https://github.com/nanobpm/nano-bpm/issues/1963) is fixed: the gateway now
+  owns its subscriptions (`elementInstanceKey` = the gateway) and activates
+  only the winning catch, pinned record-for-record against Zeebe by the
+  `evt-gateway-{message,timer,signal}` differential scenarios
+  (`formal/traces/scenarios/`).

@@ -1,0 +1,217 @@
+{
+  "scenario" : "evt-gateway-signal",
+  "zeebePin" : "5a3c4a1ca7cd9a0c50be34227fe3b4d8bf731dcf",
+  "steps" : [ {
+    "step" : 0,
+    "op" : "createInstance",
+    "records" : [ {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATING",
+      "elementId" : "evt-gateway-signal",
+      "bpmnElementType" : "PROCESS",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : -1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATED",
+      "elementId" : "evt-gateway-signal",
+      "bpmnElementType" : "PROCESS",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : -1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATING",
+      "elementId" : "start",
+      "bpmnElementType" : "START_EVENT",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATED",
+      "elementId" : "start",
+      "bpmnElementType" : "START_EVENT",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_COMPLETING",
+      "elementId" : "start",
+      "bpmnElementType" : "START_EVENT",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_COMPLETED",
+      "elementId" : "start",
+      "bpmnElementType" : "START_EVENT",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "SEQUENCE_FLOW_TAKEN",
+      "elementId" : "f-start",
+      "bpmnElementType" : "SEQUENCE_FLOW",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATING",
+      "elementId" : "gw",
+      "bpmnElementType" : "EVENT_BASED_GATEWAY",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATED",
+      "elementId" : "gw",
+      "bpmnElementType" : "EVENT_BASED_GATEWAY",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_MESSAGE_SUBSCRIPTION",
+      "intent" : "CREATED",
+      "elementId" : "onMsg",
+      "messageName" : "go",
+      "processInstanceKey" : 1,
+      "elementInstanceKey" : 2
+    }, {
+      "valueType" : "TIMER",
+      "intent" : "CREATED",
+      "targetElementId" : "onTimer",
+      "processInstanceKey" : 1,
+      "elementInstanceKey" : 2
+    }, {
+      "valueType" : "VARIABLE",
+      "intent" : "CREATED",
+      "name" : "orderId",
+      "value" : "order-1",
+      "scopeElementId" : "evt-gateway-signal",
+      "processInstanceKey" : 1,
+      "scopeKey" : 1
+    } ]
+  }, {
+    "step" : 1,
+    "op" : "broadcastSignal",
+    "records" : [ {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_COMPLETING",
+      "elementId" : "gw",
+      "bpmnElementType" : "EVENT_BASED_GATEWAY",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_COMPLETED",
+      "elementId" : "gw",
+      "bpmnElementType" : "EVENT_BASED_GATEWAY",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATING",
+      "elementId" : "onSig",
+      "bpmnElementType" : "INTERMEDIATE_CATCH_EVENT",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATED",
+      "elementId" : "onSig",
+      "bpmnElementType" : "INTERMEDIATE_CATCH_EVENT",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_COMPLETING",
+      "elementId" : "onSig",
+      "bpmnElementType" : "INTERMEDIATE_CATCH_EVENT",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_COMPLETED",
+      "elementId" : "onSig",
+      "bpmnElementType" : "INTERMEDIATE_CATCH_EVENT",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "SEQUENCE_FLOW_TAKEN",
+      "elementId" : "f-sig-end",
+      "bpmnElementType" : "SEQUENCE_FLOW",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATING",
+      "elementId" : "endSig",
+      "bpmnElementType" : "END_EVENT",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATED",
+      "elementId" : "endSig",
+      "bpmnElementType" : "END_EVENT",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_COMPLETING",
+      "elementId" : "endSig",
+      "bpmnElementType" : "END_EVENT",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_COMPLETED",
+      "elementId" : "endSig",
+      "bpmnElementType" : "END_EVENT",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_COMPLETING",
+      "elementId" : "evt-gateway-signal",
+      "bpmnElementType" : "PROCESS",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : -1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_COMPLETED",
+      "elementId" : "evt-gateway-signal",
+      "bpmnElementType" : "PROCESS",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : -1
+    }, {
+      "valueType" : "PROCESS_MESSAGE_SUBSCRIPTION",
+      "intent" : "DELETED",
+      "elementId" : "onMsg",
+      "messageName" : "go",
+      "processInstanceKey" : 1,
+      "elementInstanceKey" : 2
+    }, {
+      "valueType" : "TIMER",
+      "intent" : "CANCELED",
+      "targetElementId" : "onTimer",
+      "processInstanceKey" : 1,
+      "elementInstanceKey" : 2
+    }, {
+      "valueType" : "VARIABLE",
+      "intent" : "CREATED",
+      "name" : "paid",
+      "value" : true,
+      "scopeElementId" : "onSig",
+      "processInstanceKey" : 1,
+      "scopeKey" : 3
+    }, {
+      "valueType" : "VARIABLE",
+      "intent" : "CREATED",
+      "name" : "paid",
+      "value" : true,
+      "scopeElementId" : "evt-gateway-signal",
+      "processInstanceKey" : 1,
+      "scopeKey" : 1
+    } ]
+  } ]
+}

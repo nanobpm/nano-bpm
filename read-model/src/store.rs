@@ -19230,3 +19230,142 @@ mod history_deletion_tests {
         );
     }
 }
+
+/// #2006 (#1963 slice iv): an event-based gateway owns its subscriptions, so
+/// the read model reports the GATEWAY's element instance key on every wait
+/// the gateway opens (message, timer and signal), with the target catch
+/// element id — Zeebe's `PROCESS_MESSAGE_SUBSCRIPTION` records carry the
+/// gateway's `elementInstanceKey`. Driven end to end through a real engine,
+/// on both read-model paths (event projection and snapshot reseed).
+#[cfg(test)]
+mod event_gateway_subscription_tests {
+    use std::collections::BTreeMap;
+
+    use nanobpmn_engine_core::{Command, Engine, Event, Key, ProcessBuilder, Value};
+
+    use super::{EventWaitType, ReadStore};
+
+    fn deploy_and_start(engine: &mut Engine, journal: &mut Vec<Event>) -> (Key, Key) {
+        let def = ProcessBuilder::new("evt")
+            .start_event("start")
+            .event_based_gateway("gw")
+            .message_intermediate_catch_event("onMsg", "M1", "=key")
+            .timer_intermediate_catch_event("onTimer", 60_000)
+            .signal_intermediate_catch_event("onSig", "S1")
+            .end_event("end")
+            .connect("start", "gw")
+            .connect("gw", "onMsg")
+            .connect("gw", "onTimer")
+            .connect("gw", "onSig")
+            .connect("onMsg", "end")
+            .connect("onTimer", "end")
+            .connect("onSig", "end")
+            .build()
+            .unwrap();
+        journal.extend(
+            engine
+                .apply_command_at(Command::DeployProcess(def), 1_000)
+                .unwrap(),
+        );
+        let vars = BTreeMap::from([("key".to_string(), Value::Str("k1".into()))]);
+        let created = engine
+            .apply_command_at(Command::create_instance_with("evt", vars), 2_000)
+            .unwrap();
+        let inst = created.iter().find_map(Event::instance_key).unwrap();
+        let gw = created
+            .iter()
+            .find_map(|e| match e {
+                Event::ElementActivated {
+                    element_instance_key,
+                    element_id,
+                    ..
+                } if element_id == "gw" => Some(*element_instance_key),
+                _ => None,
+            })
+            .unwrap();
+        journal.extend(created);
+        (inst, gw)
+    }
+
+    fn project(journal: &[Event]) -> ReadStore {
+        let store = ReadStore::open(None).unwrap();
+        let refs: Vec<&Event> = journal.iter().collect();
+        store.export(&refs).unwrap();
+        store
+    }
+
+    fn assert_gateway_owned(store: &ReadStore, inst: Key, gw: Key, path: &str) {
+        let subs = store.message_subscriptions();
+        assert_eq!(subs.len(), 1, "{path}: one message wait");
+        assert_eq!(subs[0].instance_key, inst);
+        assert_eq!(subs[0].element_instance_key, gw, "{path}: gateway-owned");
+        assert_eq!(subs[0].element_id, "onMsg", "{path}: tagged with catch id");
+        let mut waits = store.event_waits();
+        waits.sort_by(|a, b| a.element_id.cmp(&b.element_id));
+        assert_eq!(waits.len(), 2, "{path}: timer + signal waits");
+        for w in &waits {
+            assert_eq!(
+                w.element_instance_key, gw,
+                "{path}: {} gateway-owned",
+                w.element_id
+            );
+        }
+        assert_eq!(waits[0].element_id, "onSig");
+        assert_eq!(waits[0].wait_type, EventWaitType::Signal);
+        assert_eq!(waits[1].element_id, "onTimer");
+        assert_eq!(waits[1].wait_type, EventWaitType::Timer);
+    }
+
+    #[test]
+    fn gateway_owned_waits_report_the_gateway_element_instance_key() {
+        let mut engine = Engine::new();
+        let mut journal = Vec::new();
+        let (inst, gw) = deploy_and_start(&mut engine, &mut journal);
+
+        assert_gateway_owned(&project(&journal), inst, gw, "projected");
+        let seeded = ReadStore::open(None).unwrap();
+        seeded.export(&[&journal[0]]).unwrap();
+        seeded.seed_from_engine_state(engine.state()).unwrap();
+        assert_gateway_owned(&seeded, inst, gw, "reseeded");
+    }
+
+    #[test]
+    fn correlating_a_gateway_owned_message_records_the_gateway_key_and_clears_all_waits() {
+        let mut engine = Engine::new();
+        let mut journal = Vec::new();
+        let (inst, gw) = deploy_and_start(&mut engine, &mut journal);
+        journal.extend(
+            engine
+                .apply_command_at(Command::correlate_message("M1", "k1"), 3_000)
+                .unwrap(),
+        );
+        let store = project(&journal);
+        assert!(store.message_subscriptions().is_empty());
+        assert!(store.event_waits().is_empty(), "loser waits deleted");
+        let corr = store.correlated_message_subscriptions();
+        assert_eq!(corr.len(), 1);
+        assert_eq!(corr[0].instance_key, inst);
+        assert_eq!(corr[0].element_instance_key, gw);
+        assert_eq!(corr[0].element_id, "onMsg");
+    }
+
+    #[test]
+    fn firing_a_gateway_owned_timer_or_signal_clears_every_wait() {
+        for trigger in [
+            Command::TriggerTimers { now: 70_000 },
+            Command::BroadcastSignal {
+                signal_name: "S1".into(),
+                variables: BTreeMap::new(),
+            },
+        ] {
+            let mut engine = Engine::new();
+            let mut journal = Vec::new();
+            deploy_and_start(&mut engine, &mut journal);
+            journal.extend(engine.apply_command_at(trigger, 70_000).unwrap());
+            let store = project(&journal);
+            assert!(store.message_subscriptions().is_empty());
+            assert!(store.event_waits().is_empty());
+            assert!(store.correlated_message_subscriptions().is_empty());
+        }
+    }
+}

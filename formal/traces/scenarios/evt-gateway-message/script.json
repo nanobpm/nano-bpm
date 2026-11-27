@@ -1,0 +1,7 @@
+{
+  "description": "An event-based gateway waits on gateway-owned message/timer/signal subscriptions (elementInstanceKey = the gateway); the message wins: the gateway completes, onMsg is activated directly (no gateway->catch flow taken), the losing timer is canceled and the losers are never activated (#1963).",
+  "steps": [
+    {"op": "createInstance", "bpmnProcessId": "evt-gateway-message", "variables": {"orderId": "order-1"}},
+    {"op": "publishMessage", "name": "go", "correlationKey": "order-1", "variables": {"paid": true}}
+  ]
+}
