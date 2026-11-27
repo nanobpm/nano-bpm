@@ -63719,9 +63719,10 @@ mod no_direct_engine_apply_guard {
         // bare name. #1308.
         "apply_create_instance_direct",
         // The periodic timer tick drives led partitions through Raft
-        // (`tick_partition_via_raft`) and applies locally only when Raft is off.
-        // `main` is a free function, so it is keyed by its bare name.
-        "main",
+        // (`tick_partition_via_raft`) and applies locally only when Raft is off
+        // (`TickPath::Local`). The background loop in `main` is a thin driver
+        // around `ServerImpl::clock_tick` (#2054).
+        "ServerImpl::clock_tick",
         // Startup demo-process seed on a fresh deployment partition
         // (`journals[0].apply_command(Command::DeployProcess)`): runs once at
         // bootstrap before the node serves traffic, is re-derived from the
@@ -63967,7 +63968,6 @@ mod no_direct_engine_apply_guard {
         // exemption. Keep this set of bare-name free functions explicit so a new
         // *method* entry cannot silently slip in unscoped.
         const BARE_FREE_FNS: &[&str] = &[
-            "main",
             "apply_create_instance_direct",
             "reconcile_lenient_completion_local",
         ];
