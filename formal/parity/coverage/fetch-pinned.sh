@@ -39,7 +39,7 @@ fetch_pinned() {
   mkdir -p "$(dirname "$dest")"
   local budget="${FETCH_PINNED_BUDGET_S:-300}" sleeper="${FETCH_PINNED_SLEEP:-sleep}"
   local clock="${FETCH_PINNED_NOW:-date +%s}"
-  local tmp="$dest.tmp" hdr="$dest.hdr" url status="none" start elapsed remaining delay ra maxt wait_s
+  local tmp="$dest.tmp" hdr="$dest.hdr" url status="none" start elapsed remaining delay ra maxt wait_s rc
   for url in "$@"; do
     start="$($clock)" delay=5
     while :; do
@@ -49,7 +49,10 @@ fetch_pinned() {
       (( remaining < 1 )) && break
       maxt=$remaining; (( maxt > 300 )) && maxt=300
       echo "$name: fetching $url"
-      status="$(curl -sS -L --connect-timeout 20 --max-time "$maxt" -D "$hdr" -o "$tmp" -w '%{http_code}' "$url" 2>/dev/null)" || true
+      status="$(curl -sS -L --connect-timeout 20 --max-time "$maxt" -D "$hdr" -o "$tmp" -w '%{http_code}' "$url" 2>/dev/null)" && rc=0 || rc=$?
+      # A nonzero curl exit is a transport failure (timeout, cut connection)
+      # even when the status line read 200: retry it, never checksum it.
+      (( rc != 0 )) && status=000
       status="${status:-000}"
       if [[ "$status" == 200 ]]; then
         if [[ "$(fetch_pinned_sha256 "$tmp")" == "$want" ]]; then

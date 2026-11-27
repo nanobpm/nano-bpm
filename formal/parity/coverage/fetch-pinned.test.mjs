@@ -30,6 +30,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in -D) hdr="$2"; shift;; -o) out="$2"; shift;; esac; shift
 done
 { echo "HTTP/1.1 $code"; [[ -n "$ra" ]] && echo "\${hname:-Retry-After}: $ra"; } | sed 's/$/\\r/' > "$hdr"
+if [[ "$code" == cut ]]; then printf j > "$out"; printf 200; exit 18; fi
 if [[ "$code" == bad ]]; then printf bad > "$out"; printf 200; exit 0; fi
 [[ "$code" == 200 ]] && printf '${BODY}' > "$out"
 [[ "$code" == 000 ]] && exit 7
@@ -128,4 +129,12 @@ test('no request is issued once the per-source budget is spent', () => {
   const c = run(['503 - 3', '503', '200'], { budget: 9 });
   assert.equal(c.status, 0, c.stderr);
   assert.deepEqual(c.maxtimes, [9, 1, 9]);
+});
+
+test('a nonzero curl exit on HTTP 200 is a transient retry, not a SHA mismatch', () => {
+  const r = run(['cut', '200']);
+  assert.equal(r.status, 0, r.stderr);
+  assert.deepEqual(r.calls, ['https://one/a.jar', 'https://one/a.jar']);
+  assert.deepEqual(r.sleeps, [5]);
+  assert.doesNotMatch(r.stderr, /SHA-256/);
 });
