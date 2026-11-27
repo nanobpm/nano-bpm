@@ -19252,14 +19252,19 @@ mod event_gateway_subscription_tests {
             .message_intermediate_catch_event("onMsg", "M1", "=key")
             .timer_intermediate_catch_event("onTimer", 60_000)
             .signal_intermediate_catch_event("onSig", "S1")
+            // Park after the winning catch so the instance stays active:
+            // `ProcessInstanceCompleted` wipes every wait table for the
+            // instance, which would mask a missing per-subscription cleanup.
+            .service_task("park", "park")
             .end_event("end")
             .connect("start", "gw")
             .connect("gw", "onMsg")
             .connect("gw", "onTimer")
             .connect("gw", "onSig")
-            .connect("onMsg", "end")
-            .connect("onTimer", "end")
-            .connect("onSig", "end")
+            .connect("onMsg", "park")
+            .connect("onTimer", "park")
+            .connect("onSig", "park")
+            .connect("park", "end")
             .build()
             .unwrap();
         journal.extend(
@@ -19292,6 +19297,17 @@ mod event_gateway_subscription_tests {
         let refs: Vec<&Event> = journal.iter().collect();
         store.export(&refs).unwrap();
         store
+    }
+
+    /// The instance must still be running (parked on `park`), so empty wait
+    /// tables prove per-subscription cleanup rather than completion's wipe.
+    fn assert_still_active(store: &ReadStore, inst: Key) {
+        let pi = store.process_instance(inst).expect("instance projected");
+        assert_eq!(
+            pi.state,
+            super::ProcessInstanceState::Active,
+            "instance must not have completed"
+        );
     }
 
     fn assert_gateway_owned(store: &ReadStore, inst: Key, gw: Key, path: &str) {
@@ -19340,6 +19356,7 @@ mod event_gateway_subscription_tests {
                 .unwrap(),
         );
         let store = project(&journal);
+        assert_still_active(&store, inst);
         assert!(store.message_subscriptions().is_empty());
         assert!(store.event_waits().is_empty(), "loser waits deleted");
         let corr = store.correlated_message_subscriptions();
@@ -19360,9 +19377,10 @@ mod event_gateway_subscription_tests {
         ] {
             let mut engine = Engine::new();
             let mut journal = Vec::new();
-            deploy_and_start(&mut engine, &mut journal);
+            let (inst, _) = deploy_and_start(&mut engine, &mut journal);
             journal.extend(engine.apply_command_at(trigger, 70_000).unwrap());
             let store = project(&journal);
+            assert_still_active(&store, inst);
             assert!(store.message_subscriptions().is_empty());
             assert!(store.event_waits().is_empty());
             assert!(store.correlated_message_subscriptions().is_empty());
