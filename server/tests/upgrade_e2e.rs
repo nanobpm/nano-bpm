@@ -1000,6 +1000,14 @@ fn drive_until_covered(
         // Wait until the new instances are applied everywhere, so the check
         // reads every member's settled log rather than a lagging one.
         assert_visible_everywhere(c, keys);
+        // Every blocking step inside a round is itself bounded (60 s), so a
+        // round always returns; re-checking here makes the phase budget a hard
+        // limit, so a slow round that overshoots it fails rather than passes.
+        assert!(
+            Instant::now() < deadline,
+            "{what} exceeded its 180 s budget\n{}",
+            tail(&c.all_logs())
+        );
     }
 }
 
