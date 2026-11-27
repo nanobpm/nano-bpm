@@ -492,3 +492,212 @@ fn latched_new_runtime_gateways_are_not_refused() {
     complete_one(&mut engine, "gw-end");
     assert!(refused(&engine).is_empty(), "the winner catch is active");
 }
+
+/// Applies `cmd` to `engine`, recording its events in `journal`.
+fn journaled(engine: &mut Engine, journal: &mut Vec<Event>, cmd: Command) -> Vec<Event> {
+    let events = engine.apply_command(cmd).unwrap();
+    journal.extend(events.iter().cloned());
+    events
+}
+
+/// A latched engine plus its full journal (deploy + the latching instance).
+fn latched_with_journal() -> (Engine, Vec<Event>) {
+    let (mut engine, mut journal) = engine_with(true);
+    journaled(
+        &mut engine,
+        &mut journal,
+        Command::create_instance_with("evt", vars(&[("key", Value::Str("k0".into()))])),
+    );
+    assert!(engine.event_gateway_runtime_latched());
+    (engine, journal)
+}
+
+/// Every recovery path a latched partition takes: the live engine, journal-
+/// only replay and (with serde) a snapshot round-trip. Each must load
+/// without refusal.
+fn recovered(live: &Engine, journal: &[Event]) -> Vec<Engine> {
+    let replayed = Engine::replay(journal.to_vec());
+    assert!(replayed.event_gateway_runtime_latched());
+    #[allow(unused_mut)]
+    let mut out = vec![replayed];
+    #[cfg(feature = "serde")]
+    out.push(reload(live));
+    let _ = live;
+    for engine in &out {
+        assert!(
+            engine
+                .state()
+                .refused_legacy_event_gateway_race_instances()
+                .is_empty(),
+            "latched new-runtime state must load"
+        );
+    }
+    out
+}
+
+fn assert_completed(engine: &Engine, inst: Key) {
+    assert_eq!(
+        engine.instance(inst).unwrap().state,
+        crate::state::ProcessInstanceState::Completed
+    );
+}
+
+/// #2047 review: on a LATCHED partition, `ModifyInstance` activating an
+/// event-based gateway with element-local variables emits `ElementActivated`
+/// before its start listener runs (clearing `activating`). The gateway paused
+/// on that listener is new-runtime state: it must survive snapshot load and
+/// journal-only replay, and the instance must then complete.
+#[test]
+fn latched_modified_gateway_paused_on_start_listener_recovers() {
+    let listened = ProcessBuilder::new("evtl")
+        .start_event("start")
+        .user_task("hold")
+        .event_based_gateway("gw")
+        .message_intermediate_catch_event("onM1", "M1", "=key")
+        .message_intermediate_catch_event("onM2", "M2", "=key")
+        .end_event("end1")
+        .end_event("end2")
+        .connect("start", "hold")
+        .connect("hold", "gw")
+        .connect("gw", "onM1")
+        .connect("gw", "onM2")
+        .connect("onM1", "end1")
+        .connect("onM2", "end2")
+        .with_listeners(
+            "gw",
+            vec![el(ListenerEventType::Start, "gw-start")],
+            Vec::new(),
+        )
+        .build()
+        .unwrap();
+    let (mut live, mut journal) = latched_with_journal();
+    journaled(&mut live, &mut journal, Command::DeployProcess(listened));
+    let events = journaled(
+        &mut live,
+        &mut journal,
+        Command::create_instance_with("evtl", vars(&[("key", Value::Str("k".into()))])),
+    );
+    let inst = events.iter().find_map(|e| e.instance_key()).unwrap();
+    let hold = live.state().instances[&inst]
+        .active
+        .iter()
+        .find_map(|(k, id)| (id == "hold").then_some(*k))
+        .unwrap();
+    journaled(
+        &mut live,
+        &mut journal,
+        Command::modify_instance(
+            inst,
+            vec![crate::command::ActivateElementInstruction {
+                element_id: "gw".into(),
+                variable_instructions: vec![crate::event::VariableInstruction {
+                    variables: vars(&[("local", Value::Str("v".into()))]),
+                    scope_id: Some("gw".into()),
+                }],
+                ..Default::default()
+            }],
+            vec![hold],
+        ),
+    );
+    assert!(live.pending_jobs().iter().any(|j| j.job_type == "gw-start"));
+    assert!(live
+        .state()
+        .refused_legacy_event_gateway_race_instances()
+        .is_empty());
+    for mut engine in recovered(&live, &journal) {
+        complete_one(&mut engine, "gw-start");
+        engine
+            .apply_command(Command::correlate_message("M2", "k"))
+            .unwrap();
+        assert_completed(&engine, inst);
+    }
+}
+
+/// #2047 review: on a LATCHED partition, a catch activated directly onto a
+/// gateway-owned catch by `ModifyInstance` carries neither a race tag nor a
+/// gateway trigger; it is still new-runtime state and must recover.
+#[test]
+fn latched_modified_gateway_owned_catch_recovers() {
+    let (mut live, mut journal) = latched_with_journal();
+    let events = journaled(
+        &mut live,
+        &mut journal,
+        Command::create_instance_with("evt", vars(&[("key", Value::Str("k".into()))])),
+    );
+    let inst = events.iter().find_map(|e| e.instance_key()).unwrap();
+    let gw = live.state().instances[&inst]
+        .active
+        .iter()
+        .find_map(|(k, id)| (id == "gw").then_some(*k))
+        .unwrap();
+    journaled(
+        &mut live,
+        &mut journal,
+        Command::modify_instance(
+            inst,
+            vec![crate::command::ActivateElementInstruction {
+                element_id: "onM1".into(),
+                ..Default::default()
+            }],
+            vec![gw],
+        ),
+    );
+    assert!(live.state().instances[&inst]
+        .active
+        .values()
+        .any(|id| id == "onM1"));
+    for mut engine in recovered(&live, &journal) {
+        engine
+            .apply_command(Command::correlate_message("M1", "k"))
+            .unwrap();
+        assert_completed(&engine, inst);
+    }
+}
+
+/// #2047 review: on a LATCHED partition, migrating an ordinary waiting catch
+/// onto a gateway-owned catch leaves a race-less, trigger-less catch; it is
+/// new-runtime state and must recover.
+#[test]
+fn latched_catch_migrated_onto_gateway_owned_catch_recovers() {
+    let source = ProcessBuilder::new("plain")
+        .start_event("start")
+        .message_intermediate_catch_event("onM1", "M1", "=key")
+        .end_event("end1")
+        .connect("start", "onM1")
+        .connect("onM1", "end1")
+        .build()
+        .unwrap();
+    let (mut live, mut journal) = latched_with_journal();
+    journaled(&mut live, &mut journal, Command::DeployProcess(source));
+    // A distinct target (re-deploying `race_def` unchanged is a no-op).
+    let mut target = race_def();
+    target.id = "evt2".into();
+    let target_key = journaled(&mut live, &mut journal, Command::DeployProcess(target))
+        .iter()
+        .find_map(|e| match e {
+            Event::ProcessDeployed {
+                process_definition_key,
+                ..
+            } => Some(*process_definition_key),
+            _ => None,
+        })
+        .unwrap();
+    let events = journaled(
+        &mut live,
+        &mut journal,
+        Command::create_instance_with("plain", vars(&[("key", Value::Str("k".into()))])),
+    );
+    let inst = events.iter().find_map(|e| e.instance_key()).unwrap();
+    journaled(
+        &mut live,
+        &mut journal,
+        Command::migrate_instance(inst, target_key, vec![("onM1".into(), "onM1".into())]),
+    );
+    assert_eq!(live.state().instances[&inst].process_id, "evt2");
+    for mut engine in recovered(&live, &journal) {
+        engine
+            .apply_command(Command::correlate_message("M1", "k"))
+            .unwrap();
+        assert_completed(&engine, inst);
+    }
+}

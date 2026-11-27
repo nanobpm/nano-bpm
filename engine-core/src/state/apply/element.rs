@@ -25,8 +25,12 @@ pub(super) fn apply_element(state: &mut State, event: &Event) {
                 element_id,
                 *scope,
             );
+            let latched = state.event_gateway_runtime_latched;
             if let Some(instance) = state.instances.get_mut(instance_key) {
                 instance.activating.insert(*element_instance_key);
+                if latched {
+                    instance.latched_activations.insert(*element_instance_key);
+                }
                 if let Some(gateway) = race {
                     instance.races.insert(*element_instance_key, *gateway);
                 }
@@ -45,8 +49,12 @@ pub(super) fn apply_element(state: &mut State, event: &Event) {
                 element_id,
                 *scope,
             );
+            let latched = state.event_gateway_runtime_latched;
             if let Some(instance) = state.instances.get_mut(instance_key) {
                 instance.activating.remove(element_instance_key);
+                if latched {
+                    instance.latched_activations.insert(*element_instance_key);
+                }
             }
         }
 
@@ -66,6 +74,7 @@ pub(super) fn apply_element(state: &mut State, event: &Event) {
             if let Some(instance) = state.instances.get_mut(instance_key) {
                 instance.active.remove(element_instance_key);
                 instance.activating.remove(element_instance_key);
+                instance.latched_activations.remove(element_instance_key);
                 instance.scopes.remove(element_instance_key);
                 instance.parked_joins.remove(element_instance_key);
                 // Zeebe drops a scope's local variables (an activity's input
@@ -235,6 +244,7 @@ pub(super) fn apply_element(state: &mut State, event: &Event) {
                     instance.parked_joins.remove(&eik);
                     instance.active.remove(&eik);
                     instance.activating.remove(&eik);
+                    instance.latched_activations.remove(&eik);
                     instance.scopes.remove(&eik);
                     // A modification's seeded join activation opens a
                     // variable scope on the parked key before the guard

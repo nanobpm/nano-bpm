@@ -877,6 +877,9 @@
         "join_flow_arrivals": [],
         "join_instances": [],
         "key": 130,
+        "latched_activations": [
+          138
+        ],
         "multi_instances": {},
         "parent_element_instance_key": null,
         "parent_process_instance_key": null,
@@ -961,6 +964,9 @@
         "join_flow_arrivals": [],
         "join_instances": [],
         "key": 143,
+        "latched_activations": [
+          145
+        ],
         "multi_instances": {},
         "parent_element_instance_key": null,
         "parent_process_instance_key": null,

@@ -36,6 +36,12 @@ The new runtime is enabled by a one-way, journaled latch, `Event::EventGatewayRu
   catch, or a legacy gateway still in flight. Loading a latched snapshot or journal that holds any
   of them fails with the typed `LegacyEventGatewayRace` error naming the
   instances (settle or cancel them on the previous release first). It is never silently dropped.
+  Valid latched state that merely *looks* legacy (an event-based gateway activated by
+  `ModifyInstance` and paused on its start listener, or a catch activated or migrated onto a
+  gateway-owned catch) is not refused: the applier records every element instance activated or
+  migrated after the latch in `ProcessInstance::latched_activations`, derived from the journal's
+  own event order, so snapshot load and journal replay reproduce it, and the refusal skips those
+  elements. Nothing is recorded before the latch, so pre-latch legacy state is still refused.
 - **Cluster feature gate**: the capability is enabled only when every cluster member advertises
   `FEATURE_EVENT_GATEWAY_RUNTIME` (`event-gateway-runtime-v1`, `nano_falcon_protocol::cluster_join`);
   a single node is trivially on. A mixed-version cluster stays on the legacy runtime. Once any

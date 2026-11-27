@@ -1037,6 +1037,25 @@ pub struct ProcessInstance {
         serde(default, skip_serializing_if = "BTreeMap::is_empty")
     )]
     pub gateway_triggers: BTreeMap<Key, GatewayTrigger>,
+    /// Replay-safe provenance for the `event-gateway-runtime-v1` latch
+    /// (#2004, #2047 review): the live element instances that were activated
+    /// (`ElementActivating`/`ElementActivated`) or migrated
+    /// (`ProcessInstanceMigrated`) while the partition was already LATCHED.
+    /// Derived by the applier from the journal's own event order (the latch
+    /// is itself a journaled event), so snapshot load and journal replay
+    /// reproduce it identically. Such an element was created by the new
+    /// runtime — e.g. an event-based gateway activated by `ModifyInstance`
+    /// and paused on its start listener, or a catch activated or migrated
+    /// onto a gateway-owned catch — so the latched load-time refusal
+    /// ([`State::refused_legacy_event_gateway_race_instances`]) never
+    /// mistakes it for legacy state. Nothing is recorded before the latch,
+    /// so genuine pre-latch legacy state is still refused. Entries die with
+    /// their element. `serde(default)` and omitted when empty.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")
+    )]
+    pub latched_activations: std::collections::BTreeSet<Key>,
     /// Keys of incidents currently **active** on this instance (parked tokens).
     /// The full records live in [`State::incidents`] and are retained after
     /// resolution; resolving an incident removes its key from this active index
@@ -3263,6 +3282,9 @@ impl State {
         }
         i.active.iter().any(|(eik, id)| {
             *eik != except
+                // Activated on an already-latched partition (e.g. by
+                // `ModifyInstance`): new-runtime state, never legacy.
+                && !i.latched_activations.contains(eik)
                 // Still activating (e.g. parked on a start listener): it has
                 // not chosen a runtime yet — it decides when its activation
                 // body runs, so it is not legacy state.
@@ -3303,6 +3325,9 @@ impl State {
             .filter(|(eik, id)| {
                 !instance.races.contains_key(eik)
                     && !triggered(eik)
+                    // Activated or migrated on an already-latched partition:
+                    // a new-runtime catch, not a pre-#1676 race-less one.
+                    && !instance.latched_activations.contains(*eik)
                     // Only an intermediate catch can be gateway-owned: skip
                     // tasks etc. before building the race index, so a scan
                     // over ordinary workloads never traverses the model.

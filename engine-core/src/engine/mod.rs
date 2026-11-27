@@ -20938,6 +20938,7 @@ mod decompose_scaling {
                 races: BTreeMap::new(),
                 gateway_subscriptions: BTreeMap::new(),
                 gateway_triggers: BTreeMap::new(),
+                latched_activations: Default::default(),
                 incidents: Vec::new(),
                 variables_spilled: false,
                 multi_instances: BTreeMap::new(),

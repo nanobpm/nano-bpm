@@ -147,6 +147,7 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
                 races: BTreeMap::new(),
                 gateway_subscriptions: BTreeMap::new(),
                 gateway_triggers: BTreeMap::new(),
+                latched_activations: Default::default(),
                 incidents: Vec::new(),
                 variables_spilled: false,
                 multi_instances: BTreeMap::new(),
@@ -422,6 +423,7 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
                 // whole-instance teardown.
                 instance.gateway_subscriptions.clear();
                 instance.gateway_triggers.clear();
+                instance.latched_activations.clear();
                 instance.compensable.clear();
                 instance.compensation_waits.clear();
                 instance.esp_held_payloads.clear();
@@ -524,7 +526,15 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
             let target_def = state
                 .process_by_key(*target_process_definition_key)
                 .map(|d| d.definition.clone());
+            let latched = state.event_gateway_runtime_latched;
             if let Some(instance) = state.instances.get_mut(instance_key) {
+                // #2047 review: an element migrated on an already-latched
+                // partition (e.g. a waiting catch mapped onto a gateway-owned
+                // catch) is new-runtime state, never pre-latch legacy.
+                if latched {
+                    let keys: Vec<Key> = instance.active.keys().copied().collect();
+                    instance.latched_activations.extend(keys);
+                }
                 for mi in instance.multi_instances.values_mut() {
                     remap_id(&mut mi.element_id);
                     if let Some(spec) = target_def
@@ -860,6 +870,7 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
                 // whole-instance teardown.
                 instance.gateway_subscriptions.clear();
                 instance.gateway_triggers.clear();
+                instance.latched_activations.clear();
                 instance.compensable.clear();
                 instance.compensation_waits.clear();
                 instance.esp_held_payloads.clear();
