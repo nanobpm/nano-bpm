@@ -701,3 +701,69 @@ fn latched_catch_migrated_onto_gateway_owned_catch_recovers() {
         assert_completed(&engine, inst);
     }
 }
+
+/// #2047 operator review: migration on a LATCHED partition marks migrated
+/// elements as latched-activation provenance, but never a genuine legacy race
+/// (a race may outlive the latch): the load must still refuse it after the
+/// instance is migrated.
+#[test]
+fn latched_legacy_race_is_still_refused_after_migration() {
+    let (mut live, mut journal) = engine_with(false);
+    let mut target = race_def();
+    target.id = "evt2".into();
+    let target_key = journaled(&mut live, &mut journal, Command::DeployProcess(target))
+        .iter()
+        .find_map(|e| match e {
+            Event::ProcessDeployed {
+                process_definition_key,
+                ..
+            } => Some(*process_definition_key),
+            _ => None,
+        })
+        .unwrap();
+    let (inst, created) = create(&mut live);
+    journal.extend(created);
+    journal.push(Event::EventGatewayRuntimeActivated { partition: 0 });
+    let mut latched = Engine::replay(journal.clone());
+    assert!(latched.event_gateway_runtime_latched());
+    assert_eq!(
+        latched
+            .state()
+            .refused_legacy_event_gateway_race_instances(),
+        vec![inst]
+    );
+    let migrated = latched
+        .apply_command(Command::migrate_instance(
+            inst,
+            target_key,
+            vec![
+                ("onM1".into(), "onM1".into()),
+                ("onM2".into(), "onM2".into()),
+            ],
+        ))
+        .unwrap();
+    journal.extend(migrated);
+    assert_eq!(latched.state().instances[&inst].process_id, "evt2");
+    assert!(latched.state().instances[&inst]
+        .latched_activations
+        .is_empty());
+    assert_eq!(
+        latched
+            .state()
+            .refused_legacy_event_gateway_race_instances(),
+        vec![inst]
+    );
+    assert_eq!(
+        Engine::replay(journal)
+            .state()
+            .refused_legacy_event_gateway_race_instances(),
+        vec![inst]
+    );
+    #[cfg(feature = "serde")]
+    assert_eq!(
+        reload(&latched)
+            .state()
+            .refused_legacy_event_gateway_race_instances(),
+        vec![inst]
+    );
+}

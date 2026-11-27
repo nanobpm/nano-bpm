@@ -526,15 +526,30 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
             let target_def = state
                 .process_by_key(*target_process_definition_key)
                 .map(|d| d.definition.clone());
-            let latched = state.event_gateway_runtime_latched;
+            // #2047 review: an element migrated on an already-latched
+            // partition (e.g. a waiting catch mapped onto a gateway-owned
+            // catch) is new-runtime state, never pre-latch legacy — EXCEPT
+            // genuine legacy gateway state (a race may outlive the latch),
+            // classified on the source definition before the remap, so a
+            // latched load still refuses it.
+            let newly_latched: Vec<Key> = if state.event_gateway_runtime_latched {
+                state
+                    .instances
+                    .get(instance_key)
+                    .map(|i| {
+                        let legacy = state.legacy_event_gateway_keys(i);
+                        i.active
+                            .keys()
+                            .filter(|k| !legacy.contains(k))
+                            .copied()
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
             if let Some(instance) = state.instances.get_mut(instance_key) {
-                // #2047 review: an element migrated on an already-latched
-                // partition (e.g. a waiting catch mapped onto a gateway-owned
-                // catch) is new-runtime state, never pre-latch legacy.
-                if latched {
-                    let keys: Vec<Key> = instance.active.keys().copied().collect();
-                    instance.latched_activations.extend(keys);
-                }
+                instance.latched_activations.extend(newly_latched);
                 for mi in instance.multi_instances.values_mut() {
                     remap_id(&mut mi.element_id);
                     if let Some(spec) = target_def

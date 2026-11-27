@@ -3280,25 +3280,88 @@ impl State {
         if Self::has_raceless_legacy_catch(&def.definition, i) {
             return true;
         }
-        i.active.iter().any(|(eik, id)| {
-            *eik != except
-                // Activated on an already-latched partition (e.g. by
-                // `ModifyInstance`): new-runtime state, never legacy.
-                && !i.latched_activations.contains(eik)
-                // Still activating (e.g. parked on a start listener): it has
-                // not chosen a runtime yet — it decides when its activation
-                // body runs, so it is not legacy state.
-                && !i.activating.contains(eik)
-                && !i.gateway_subscriptions.contains_key(eik)
-                // A new-runtime gateway already triggered (its subscriptions
-                // closed, e.g. parked on its end listener) carries the
-                // recorded trigger instead.
-                && !i.gateway_triggers.contains_key(eik)
-                && def
-                    .definition
-                    .element(id)
-                    .is_some_and(|e| matches!(e.kind, crate::model::ElementKind::EventBasedGateway))
-        })
+        i.active
+            .iter()
+            .any(|(eik, id)| *eik != except && Self::is_legacy_gateway(&def.definition, i, eik, id))
+    }
+
+    /// The element instances of `instance` that ARE legacy event-gateway
+    /// state (#2047 review): race members (`races`), legacy gateways still in
+    /// flight and race-less legacy gateway catches — the per-key form of
+    /// [`is_legacy_event_gateway_blocker`](Self::is_legacy_event_gateway_blocker),
+    /// built from the same predicates. Migration on a latched partition marks
+    /// every OTHER active element as latched-activation provenance, so a
+    /// genuine legacy element is never laundered into new-runtime state.
+    pub fn legacy_event_gateway_keys(
+        &self,
+        instance: &ProcessInstance,
+    ) -> std::collections::BTreeSet<Key> {
+        let mut keys: std::collections::BTreeSet<Key> = instance.races.keys().copied().collect();
+        let Some(def) = self.definition_for(instance) else {
+            return keys;
+        };
+        let def = &def.definition;
+        let mut index = None;
+        for (eik, id) in &instance.active {
+            if Self::is_legacy_gateway(def, instance, eik, id) {
+                keys.insert(*eik);
+            } else if Self::is_raceless_catch_candidate(def, instance, eik, id) {
+                let index =
+                    index.get_or_insert_with(|| crate::engine::event_gateway_race_index(def));
+                if index.owner_of(id).is_some() {
+                    keys.insert(*eik);
+                }
+            }
+        }
+        keys
+    }
+
+    /// Whether active element `eik` (`id`) is a legacy event-based gateway
+    /// still in flight: no new-runtime subscriptions or trigger, not
+    /// activated on a latched partition and not still activating.
+    fn is_legacy_gateway(
+        def: &crate::model::ProcessDefinition,
+        i: &ProcessInstance,
+        eik: &Key,
+        id: &str,
+    ) -> bool {
+        // Activated on an already-latched partition (e.g. by
+        // `ModifyInstance`): new-runtime state, never legacy.
+        !i.latched_activations.contains(eik)
+            // Still activating (e.g. parked on a start listener): it has
+            // not chosen a runtime yet — it decides when its activation
+            // body runs, so it is not legacy state.
+            && !i.activating.contains(eik)
+            && !i.gateway_subscriptions.contains_key(eik)
+            // A new-runtime gateway already triggered (its subscriptions
+            // closed, e.g. parked on its end listener) carries the
+            // recorded trigger instead.
+            && !i.gateway_triggers.contains_key(eik)
+            && def
+                .element(id)
+                .is_some_and(|e| matches!(e.kind, crate::model::ElementKind::EventBasedGateway))
+    }
+
+    /// Whether active element `eik` (`id`) could be a race-less legacy
+    /// gateway catch, before the (costlier) gateway-ownership check.
+    fn is_raceless_catch_candidate(
+        def: &crate::model::ProcessDefinition,
+        instance: &ProcessInstance,
+        eik: &Key,
+        id: &str,
+    ) -> bool {
+        !instance.races.contains_key(eik)
+            && !instance
+                .gateway_triggers
+                .values()
+                .any(|t| t.catch_element_instance_key == *eik)
+            // Activated or migrated on an already-latched partition:
+            // a new-runtime catch, not a pre-#1676 race-less one.
+            && !instance.latched_activations.contains(eik)
+            // Only an intermediate catch can be gateway-owned: skip
+            // tasks etc. before building the race index, so a scan
+            // over ordinary workloads never traverses the model.
+            && crate::engine::is_intermediate_catch(def, id)
     }
 
     /// Whether `instance` holds a RACE-LESS legacy gateway catch (#2047
@@ -3313,26 +3376,10 @@ impl State {
         def: &crate::model::ProcessDefinition,
         instance: &ProcessInstance,
     ) -> bool {
-        let triggered = |eik: &Key| {
-            instance
-                .gateway_triggers
-                .values()
-                .any(|t| t.catch_element_instance_key == *eik)
-        };
         let candidates: Vec<&str> = instance
             .active
             .iter()
-            .filter(|(eik, id)| {
-                !instance.races.contains_key(eik)
-                    && !triggered(eik)
-                    // Activated or migrated on an already-latched partition:
-                    // a new-runtime catch, not a pre-#1676 race-less one.
-                    && !instance.latched_activations.contains(*eik)
-                    // Only an intermediate catch can be gateway-owned: skip
-                    // tasks etc. before building the race index, so a scan
-                    // over ordinary workloads never traverses the model.
-                    && crate::engine::is_intermediate_catch(def, id)
-            })
+            .filter(|(eik, id)| Self::is_raceless_catch_candidate(def, instance, eik, id))
             .map(|(_, id)| id.as_str())
             .collect();
         if candidates.is_empty() {
