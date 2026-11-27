@@ -87,6 +87,42 @@ fn owned(engine: &Engine, eik: Key) -> usize {
             .count()
 }
 
+/// Exactly one live subscription of each kind rests on the gateway `eik`,
+/// each targeting its own catch: `[message, timer, signal, conditional]`.
+fn assert_one_per_catch(engine: &Engine, eik: Key) {
+    use crate::state::{MessageSubscriptionState as Sub, TimerState};
+    let s = engine.state();
+    let live = |st: &Sub| matches!(st, Sub::Open | Sub::Opening);
+    let msg: Vec<&str> = s
+        .message_subscriptions
+        .values()
+        .filter(|x| x.element_instance_key == eik && live(&x.state))
+        .map(|x| x.element_id.as_str())
+        .collect();
+    let tmr: Vec<&str> = s
+        .timers
+        .values()
+        .filter(|x| x.element_instance_key == eik && x.state == TimerState::Created)
+        .map(|x| x.element_id.as_str())
+        .collect();
+    let sig: Vec<&str> = s
+        .signal_subscriptions
+        .values()
+        .filter(|x| x.element_instance_key == eik && live(&x.state))
+        .map(|x| x.element_id.as_str())
+        .collect();
+    let cond: Vec<&str> = s
+        .conditional_subscriptions
+        .values()
+        .filter(|x| x.element_instance_key == eik && live(&x.state))
+        .map(|x| x.element_id.as_str())
+        .collect();
+    assert_eq!(msg, vec!["onMsg"], "one message subscription");
+    assert_eq!(tmr, vec!["onTimer"], "one timer");
+    assert_eq!(sig, vec!["onSig"], "one signal subscription");
+    assert_eq!(cond, vec!["onCond"], "one conditional subscription");
+}
+
 /// Fires every kind of event the gateway subscribed to; none may activate
 /// anything once the gateway is gone.
 fn assert_nothing_fires(engine: &mut Engine, inst: Key) {
@@ -133,6 +169,7 @@ fn waiting_gateway_owns_one_subscription_per_catch() {
     let (engine, inst) = start(four_kind_race("evt").build().unwrap());
     let gw = eik_of(&engine, inst, "gw").expect("gateway waits");
     assert_eq!(owned(&engine, gw), 4);
+    assert_one_per_catch(&engine, gw);
     for catch in ["onMsg", "onTimer", "onSig", "onCond"] {
         assert!(eik_of(&engine, inst, catch).is_none(), "{catch} not armed");
     }
@@ -196,11 +233,9 @@ fn modify_moving_off_the_gateway_unsubscribes_it_and_arms_the_target() {
         .apply_command(Command::correlate_message("M1", "k"))
         .unwrap();
     assert!(eik_of(&engine, inst, "onMsg").is_none());
-    // Only the gateway's other subscriptions could have fired; none remain.
-    let events = engine.trigger_timers(60_000);
-    assert!(!events
-        .iter()
-        .any(|e| matches!(e, Event::ElementActivated { .. })));
+    // None of the gateway's former subscriptions (timer, signal, conditional,
+    // or a second message) may activate a catch or trigger the gateway.
+    assert_gateway_torn_down(&mut engine, inst, gw);
 }
 
 #[test]
@@ -221,6 +256,7 @@ fn modify_activating_a_gateway_opens_its_owned_subscriptions() {
     let gw = eik_of(&engine, inst, "gw").expect("re-activated gateway waits");
     assert_ne!(gw, old);
     assert_eq!(owned(&engine, gw), 4);
+    assert_one_per_catch(&engine, gw);
     assert_eq!(
         engine.state().instances[&inst].gateway_subscriptions[&gw],
         vec!["onMsg", "onTimer", "onSig", "onCond"]
