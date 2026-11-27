@@ -21516,15 +21516,13 @@ pub(crate) fn is_intermediate_catch(
     def: &crate::model::ProcessDefinition,
     element_id: &str,
 ) -> bool {
-    matches!(
-        def.elements.get(element_id).map(|e| &e.kind),
-        Some(
-            ElementKind::TimerIntermediateCatchEvent { .. }
-                | ElementKind::MessageIntermediateCatchEvent { .. }
-                | ElementKind::SignalIntermediateCatchEvent { .. }
-                | ElementKind::ConditionalIntermediateCatchEvent { .. }
-        )
-    )
+    // Delegates to the one shared classification (#2076). Callers such as
+    // `event_gateway_race_index` add the legacy race model's extra
+    // single-incoming requirements on top; `event_gateway_targets` does not
+    // (Zeebe subscribes on every catch target) — an intended difference.
+    def.elements
+        .get(element_id)
+        .is_some_and(|e| e.kind.is_intermediate_catch())
 }
 
 /// One O(V + E) pass over a definition's flow graph indexing which catch

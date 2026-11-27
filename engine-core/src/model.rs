@@ -1143,6 +1143,57 @@ pub enum ElementKind {
 }
 
 impl ElementKind {
+    /// Whether this kind is an intermediate catch event that can take part in
+    /// an event-based gateway's deferred choice (#2076). The ONE
+    /// classification shared by gateway subscription opening
+    /// ([`ProcessDefinition::event_gateway_targets`]) and legacy-race
+    /// detection (`engine::is_intermediate_catch` →
+    /// `event_gateway_race_index`), so the two can never disagree on which
+    /// kinds count. The match is exhaustive (no wildcard): a new variant
+    /// fails to compile until it is classified here.
+    ///
+    /// A link intermediate catch is deliberately excluded: it is a jump
+    /// target, not an event an event-based gateway can wait on.
+    pub fn is_intermediate_catch(&self) -> bool {
+        match self {
+            ElementKind::TimerIntermediateCatchEvent { .. }
+            | ElementKind::MessageIntermediateCatchEvent { .. }
+            | ElementKind::SignalIntermediateCatchEvent { .. }
+            | ElementKind::ConditionalIntermediateCatchEvent { .. } => true,
+            ElementKind::StartEvent
+            | ElementKind::EndEvent
+            | ElementKind::TerminateEndEvent
+            | ElementKind::ErrorEndEvent { .. }
+            | ElementKind::ServiceTask { .. }
+            | ElementKind::BusinessRuleTask { .. }
+            | ElementKind::UserTask(_)
+            | ElementKind::ExclusiveGateway
+            | ElementKind::ParallelGateway
+            | ElementKind::InclusiveGateway
+            | ElementKind::EventBasedGateway
+            | ElementKind::ErrorBoundaryEvent { .. }
+            | ElementKind::TimerBoundaryEvent { .. }
+            | ElementKind::MessageBoundaryEvent { .. }
+            | ElementKind::MessageStartEvent { .. }
+            | ElementKind::TimerStartEvent { .. }
+            | ElementKind::ConditionalStartEvent { .. }
+            | ElementKind::SubProcess { .. }
+            | ElementKind::EventSubProcess { .. }
+            | ElementKind::EscalationThrowEvent { .. }
+            | ElementKind::EscalationBoundaryEvent { .. }
+            | ElementKind::IntermediateThrowEvent
+            | ElementKind::LinkIntermediateThrowEvent { .. }
+            | ElementKind::LinkIntermediateCatchEvent { .. }
+            | ElementKind::Task
+            | ElementKind::ScriptTask { .. }
+            | ElementKind::CallActivity { .. }
+            | ElementKind::SignalBoundaryEvent { .. }
+            | ElementKind::ConditionalBoundaryEvent { .. }
+            | ElementKind::CompensationBoundaryEvent { .. }
+            | ElementKind::CompensationThrowEvent
+            | ElementKind::AgentTask { .. } => false,
+        }
+    }
     /// Whether an instance of this kind owns an inner **token scope** that its
     /// own start event activates in — an embedded sub-process or an event
     /// sub-process (#1555). The single source of truth for "tearing this down
@@ -1874,13 +1925,10 @@ impl ProcessDefinition {
             let Some(target) = self.element(&flow.to) else {
                 continue;
             };
-            let is_catch = matches!(
-                target.kind,
-                ElementKind::TimerIntermediateCatchEvent { .. }
-                    | ElementKind::MessageIntermediateCatchEvent { .. }
-                    | ElementKind::SignalIntermediateCatchEvent { .. }
-                    | ElementKind::ConditionalIntermediateCatchEvent { .. }
-            );
+            // Shared classification (#2076). Unlike `event_gateway_race_index`
+            // (the legacy race model), no single-incoming requirement on the
+            // gateway or catch: Zeebe subscribes on every catch target.
+            let is_catch = target.kind.is_intermediate_catch();
             if is_catch && !targets.iter().any(|t| t.id == target.id) {
                 targets.push(target);
             }

@@ -25,6 +25,7 @@ mod expression_failures;
 mod feel_fallbacks;
 mod gateway_subscriptions;
 mod incidents;
+mod intermediate_catch_classification;
 mod job_attribution;
 mod job_settlement;
 mod jobs;
