@@ -2587,7 +2587,7 @@
       "signature": "nano:completedElements,jobsCreated,sequenceFlows:completed=false/false",
       "kind": "nano",
       "issue": "#1990",
-      "fixed": false,
+      "fixed": true,
       "seed": 1139086798,
       "graph": {
         "id": "Gen_b3c3b6ae63",
@@ -2658,6 +2658,16 @@
             "correlationKey": "Gen_b3c3b6ae63-shrinkr17x31-o14",
             "settled": {
               "ack": true
+            }
+          },
+          {
+            "op": "setVariables",
+            "variables": {
+              "route_G3": [
+                [
+                  "f10"
+                ]
+              ]
             }
           },
           {
@@ -2807,7 +2817,7 @@
       "signature": "spec-oracle:jobsCreated,sequenceFlows",
       "kind": "spec-oracle",
       "issue": "#1990",
-      "fixed": false,
+      "fixed": true,
       "seed": 1139086798,
       "graph": {
         "id": "Gen_b3c3b6ae63",
@@ -2878,6 +2888,16 @@
             "correlationKey": "Gen_b3c3b6ae63-shrinkr17x57-o14",
             "settled": {
               "ack": true
+            }
+          },
+          {
+            "op": "setVariables",
+            "variables": {
+              "route_G3": [
+                [
+                  "f10"
+                ]
+              ]
             }
           },
           {
@@ -3836,7 +3856,7 @@
       "signature": "nano:completed,completedElements,sequenceFlows:completed=false/true",
       "kind": "nano",
       "issue": "#1990",
-      "fixed": false,
+      "fixed": true,
       "seed": 827360813,
       "graph": {
         "id": "Gen_5b9cf143fb",
@@ -3901,6 +3921,16 @@
             "correlationKey": "Gen_5b9cf143fb-shrinkr28x28-o1",
             "settled": {
               "jobType": "T1"
+            }
+          },
+          {
+            "op": "setVariables",
+            "variables": {
+              "route_G3": [
+                [
+                  "f10"
+                ]
+              ]
             }
           },
           {
@@ -4038,7 +4068,7 @@
       "signature": "spec-oracle:completed,sequenceFlows",
       "kind": "spec-oracle",
       "issue": "#1990",
-      "fixed": false,
+      "fixed": true,
       "seed": 827360813,
       "graph": {
         "id": "Gen_5b9cf143fb",
@@ -4103,6 +4133,16 @@
             "correlationKey": "Gen_5b9cf143fb-shrinkr28x47-o1",
             "settled": {
               "jobType": "T1"
+            }
+          },
+          {
+            "op": "setVariables",
+            "variables": {
+              "route_G3": [
+                [
+                  "f10"
+                ]
+              ]
             }
           },
           {
