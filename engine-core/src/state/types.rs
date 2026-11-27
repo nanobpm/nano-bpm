@@ -105,12 +105,6 @@ pub enum ProcessInstanceState {
     Suspended,
 }
 
-/// Arrivals at one parallel join, counted per identified incoming flow. The
-/// single implementation of Zeebe's taken-sequence-flow bookkeeping (#1233): the
-/// state applier and the engine's fire decision both go through it.
-///
-/// Kept sorted by flow with no zero counts, so its serialized form is
-/// deterministic.
 /// An event-based gateway's recorded trigger (#2004): the catch whose event
 /// fired and the element instance key its direct activation uses. See
 /// `docs/adr/0067-event-gateway-runtime-latch.md` for the arbitration and
@@ -131,6 +125,12 @@ pub struct GatewayTrigger {
     pub variables: BTreeMap<String, crate::Value>,
 }
 
+/// Arrivals at one parallel join, counted per identified incoming flow. The
+/// single implementation of Zeebe's taken-sequence-flow bookkeeping (#1233): the
+/// state applier and the engine's fire decision both go through it.
+///
+/// Kept sorted by flow with no zero counts, so its serialized form is
+/// deterministic.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct FlowArrivals(Vec<(IncomingFlow, usize)>);
