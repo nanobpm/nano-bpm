@@ -29,10 +29,15 @@ The new runtime is enabled by a one-way, journaled latch, `Event::EventGatewayRu
   passes through and arms its catches as a race.
 - **After the latch**, entries replay with the **new-runtime** semantics above. The engine records
   the latch only on a new-runtime activation, when the replicated envelope enables the capability
-  and no legacy race is in flight, so a latched log never holds legacy race state.
-- **Legacy race state on a latched partition is refused fail-closed**: loading a latched snapshot
-  or journal that holds one fails with the typed `LegacyEventGatewayRace` error naming the
+  and no legacy event-gateway state is left, so a latched log never holds any.
+- **Legacy event-gateway state on a latched partition is refused fail-closed**: legacy state is any
+  of the three kinds the latch decision waits on (one shared predicate,
+  `State::is_legacy_event_gateway_blocker`): an armed legacy race, a race-less pre-#1676 gateway
+  catch, or a legacy gateway still in flight. Loading a latched snapshot or journal that holds any
+  of them fails with the typed `LegacyEventGatewayRace` error naming the
   instances (settle or cancel them on the previous release first). It is never silently dropped.
 - **Cluster feature gate**: the capability is enabled only when every cluster member advertises
   `FEATURE_EVENT_GATEWAY_RUNTIME` (`event-gateway-runtime-v1`, `nano_falcon_protocol::cluster_join`);
-  a single node is trivially on. A mixed-version cluster stays on the legacy runtime.
+  a single node is trivially on. A mixed-version cluster stays on the legacy runtime. Once any
+  partition is latched, `required_cluster_features` permanently requires
+  `FEATURE_EVENT_GATEWAY_RUNTIME` of joining peers, so no peer without the capability can join.

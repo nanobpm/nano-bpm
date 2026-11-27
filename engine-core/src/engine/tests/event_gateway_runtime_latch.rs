@@ -336,3 +336,159 @@ fn raceless_legacy_catch_blocks_the_latch_and_cold_spill() {
     );
     assert!(!engine.event_gateway_runtime_latched());
 }
+
+/// Strips the #1676 race tags from a journal: exactly what a pre-#1676
+/// journal carries (race-less gateway catches).
+fn strip_race_tags(journal: &mut [Event]) {
+    for event in journal.iter_mut() {
+        if let Event::ElementActivating { race, .. } = event {
+            *race = None;
+        }
+    }
+}
+
+/// Snapshot round-trip through serde, as the loaders see it.
+#[cfg(feature = "serde")]
+fn reload(engine: &Engine) -> Engine {
+    let json = serde_json::to_string(&engine.snapshot()).unwrap();
+    Engine::from_snapshot(serde_json::from_str(&json).unwrap())
+}
+
+/// #2047 operator review: the load-time refusal uses the SAME predicate as
+/// the latch decision, so a latched log holding a race-less pre-#1676
+/// gateway catch (no `races` entry) is refused, after journal replay and at
+/// snapshot load — never silently run under the new runtime.
+#[test]
+fn latched_raceless_legacy_catch_is_refused_on_replay_and_snapshot_load() {
+    let (mut live, mut journal) = engine_with(false);
+    let (inst, created) = create(&mut live);
+    journal.extend(created);
+    strip_race_tags(&mut journal);
+    journal.push(Event::EventGatewayRuntimeActivated { partition: 0 });
+    let replayed = Engine::replay(journal);
+    assert!(replayed.event_gateway_runtime_latched());
+    assert!(replayed
+        .state()
+        .legacy_event_gateway_race_instances()
+        .is_empty());
+    assert_eq!(
+        replayed
+            .state()
+            .refused_legacy_event_gateway_race_instances(),
+        vec![inst]
+    );
+    #[cfg(feature = "serde")]
+    assert_eq!(
+        reload(&replayed)
+            .state()
+            .refused_legacy_event_gateway_race_instances(),
+        vec![inst]
+    );
+}
+
+/// #2047 operator review: a latched log holding a legacy gateway still in
+/// flight (paused on its end listener, no race armed yet) is refused, after
+/// journal replay and at snapshot load.
+#[test]
+fn latched_in_flight_legacy_gateway_is_refused_on_replay_and_snapshot_load() {
+    let listened = ProcessBuilder::new("evtl")
+        .start_event("start")
+        .event_based_gateway("gw")
+        .message_intermediate_catch_event("onM1", "M1", "=key")
+        .message_intermediate_catch_event("onM2", "M2", "=key")
+        .end_event("end1")
+        .end_event("end2")
+        .connect("start", "gw")
+        .connect("gw", "onM1")
+        .connect("gw", "onM2")
+        .connect("onM1", "end1")
+        .connect("onM2", "end2")
+        .with_listeners("gw", Vec::new(), vec![el(ListenerEventType::End, "gw-end")])
+        .build()
+        .unwrap();
+    let (mut live, mut journal) = engine_with(false);
+    journal.extend(
+        live.apply_command(Command::DeployProcess(listened))
+            .unwrap(),
+    );
+    let events = live
+        .apply_command(Command::create_instance_with(
+            "evtl",
+            vars(&[("key", Value::Str("k".into()))]),
+        ))
+        .unwrap();
+    let inst = events.iter().find_map(|e| e.instance_key()).unwrap();
+    journal.extend(events);
+    journal.push(Event::EventGatewayRuntimeActivated { partition: 0 });
+    let replayed = Engine::replay(journal);
+    assert!(replayed.event_gateway_runtime_latched());
+    assert!(replayed
+        .state()
+        .legacy_event_gateway_race_instances()
+        .is_empty());
+    assert_eq!(
+        replayed
+            .state()
+            .refused_legacy_event_gateway_race_instances(),
+        vec![inst]
+    );
+    #[cfg(feature = "serde")]
+    assert_eq!(
+        reload(&replayed)
+            .state()
+            .refused_legacy_event_gateway_race_instances(),
+        vec![inst]
+    );
+}
+
+/// The widened refusal must not refuse VALID latched state: a new-runtime
+/// gateway waiting on its subscriptions, or paused on its start/end
+/// listeners, is not legacy.
+#[test]
+fn latched_new_runtime_gateways_are_not_refused() {
+    let listened = ProcessBuilder::new("evtl")
+        .start_event("start")
+        .event_based_gateway("gw")
+        .message_intermediate_catch_event("onM1", "M1", "=key")
+        .message_intermediate_catch_event("onM2", "M2", "=key")
+        .end_event("end1")
+        .end_event("end2")
+        .connect("start", "gw")
+        .connect("gw", "onM1")
+        .connect("gw", "onM2")
+        .connect("onM1", "end1")
+        .connect("onM2", "end2")
+        .with_listeners(
+            "gw",
+            vec![el(ListenerEventType::Start, "gw-start")],
+            vec![el(ListenerEventType::End, "gw-end")],
+        )
+        .build()
+        .unwrap();
+    let (mut engine, _) = engine_with(true);
+    create(&mut engine);
+    assert!(engine.event_gateway_runtime_latched());
+    engine
+        .apply_command(Command::DeployProcess(listened))
+        .unwrap();
+    engine
+        .apply_command(Command::create_instance_with(
+            "evtl",
+            vars(&[("key", Value::Str("k".into()))]),
+        ))
+        .unwrap();
+    let refused = |e: &Engine| e.state().refused_legacy_event_gateway_race_instances();
+    assert!(refused(&engine).is_empty(), "paused on its start listener");
+    complete_one(&mut engine, "gw-start");
+    assert!(refused(&engine).is_empty(), "waiting on its subscriptions");
+    engine
+        .apply_command(Command::correlate_message("M1", "k"))
+        .unwrap();
+    assert!(
+        engine.pending_jobs().iter().any(|j| j.job_type == "gw-end"),
+        "the triggered gateway parks on its end listener"
+    );
+    assert!(refused(&engine).is_empty(), "paused on its end listener");
+    complete_one(&mut engine, "gw-end");
+    assert!(refused(&engine).is_empty(), "the winner catch is active");
+}

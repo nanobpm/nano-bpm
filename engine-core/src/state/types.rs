@@ -3263,7 +3263,15 @@ impl State {
         }
         i.active.iter().any(|(eik, id)| {
             *eik != except
+                // Still activating (e.g. parked on a start listener): it has
+                // not chosen a runtime yet — it decides when its activation
+                // body runs, so it is not legacy state.
+                && !i.activating.contains(eik)
                 && !i.gateway_subscriptions.contains_key(eik)
+                // A new-runtime gateway already triggered (its subscriptions
+                // closed, e.g. parked on its end listener) carries the
+                // recorded trigger instead.
+                && !i.gateway_triggers.contains_key(eik)
                 && def
                     .definition
                     .element(id)
@@ -3309,22 +3317,29 @@ impl State {
         candidates.iter().any(|id| index.owner_of(id).is_some())
     }
 
-    /// The legacy race state a loader must REFUSE (#2004): every legacy race
-    /// ([`Self::legacy_event_gateway_race_instances`]) once the
-    /// `event-gateway-runtime-v1` latch is recorded, none before it. Before
-    /// the latch the legacy runtime still owns these races (a mixed-version
-    /// cluster, or a pre-latch journal replaying under legacy semantics), so
-    /// they load and settle as before. The engine records the latch only when
-    /// no legacy race is left (`Engine::event_gateway_runtime_decision`), so a
-    /// latched snapshot or journal holding one is corrupt or hand-edited, and
-    /// is refused rather than run under semantics it was not written for.
-    /// Run after snapshot load AND after journal replay.
+    /// The legacy event-gateway state a loader must REFUSE (#2004, #2047
+    /// review): once the `event-gateway-runtime-v1` latch is recorded, every
+    /// instance that [`Self::is_legacy_event_gateway_blocker`] flags — any of
+    /// the three kinds of legacy state the latch decision waits on: an armed
+    /// legacy race (`races` membership), a race-less pre-#1676 gateway catch,
+    /// or a legacy event-based gateway still in flight. None before the
+    /// latch: the legacy runtime still owns these (a mixed-version cluster,
+    /// or a pre-latch journal replaying under legacy semantics), so they load
+    /// and settle as before. The engine records the latch only when none of
+    /// them is left (`Engine::event_gateway_runtime_decision`, the same
+    /// predicate), so a latched snapshot or journal holding one is corrupt or
+    /// hand-edited, and is refused rather than run under semantics it was not
+    /// written for. Ascending. Run after snapshot load AND after journal
+    /// replay.
     pub fn refused_legacy_event_gateway_race_instances(&self) -> Vec<Key> {
-        if self.event_gateway_runtime_latched {
-            self.legacy_event_gateway_race_instances()
-        } else {
-            Vec::new()
+        if !self.event_gateway_runtime_latched {
+            return Vec::new();
         }
+        self.instances
+            .iter()
+            .filter(|(_, i)| self.is_legacy_event_gateway_blocker(i))
+            .map(|(k, _)| *k)
+            .collect()
     }
 
     /// The settlement half of the live `VariablesLostQuarantined` fold

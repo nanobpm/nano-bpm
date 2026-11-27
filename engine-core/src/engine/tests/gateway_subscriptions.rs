@@ -139,8 +139,14 @@ fn legacy_race_detector_names_races_and_refuses_them_only_once_latched() {
         state.refused_legacy_event_gateway_race_instances(),
         vec![inst]
     );
-    // No `races` membership: nothing to refuse either way.
-    let (state, _) = legacy_race_state(false, true);
+    // Race-less gateway catches (a pre-#1676 snapshot) are legacy state
+    // too (#2047 operator review): refused once latched, loadable before.
+    let (state, inst) = legacy_race_state(false, true);
+    assert_eq!(
+        state.refused_legacy_event_gateway_race_instances(),
+        vec![inst]
+    );
+    let (state, _) = legacy_race_state(false, false);
     assert!(state
         .refused_legacy_event_gateway_race_instances()
         .is_empty());
