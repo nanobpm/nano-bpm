@@ -25,7 +25,7 @@
 // Nano differential).
 
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
 import { join, dirname, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -785,7 +785,16 @@ export function ensureModelJars(cacheRoot) {
     const dest = join(libDir, `${a.artifactId}-${a.version}.jar`);
     if (!existsSync(dest)) {
       const url = `https://repo1.maven.org/maven2/${rel}`;
-      execFileSync('curl', ['-fsSL', url, '-o', dest], { stdio: 'inherit' });
+      // Maven Central rate-limits shared CI runner IPs (HTTP 429): back off
+      // and honour Retry-After rather than failing the whole formal gate on a
+      // transient throttle. Download to a temp name and rename, so a failed or
+      // partial transfer never leaves a truncated jar that looks cached.
+      const part = `${dest}.part`;
+      execFileSync('curl', [
+        '-fsSL', '--retry', '6', '--retry-delay', '10', '--retry-max-time', '300',
+        '--retry-all-errors', url, '-o', part,
+      ], { stdio: 'inherit' });
+      renameSync(part, dest);
     }
     const actual = execFileSync('sha256sum', [dest]).toString().split(/\s+/)[0];
     if (a.sha256 && actual !== a.sha256) {
