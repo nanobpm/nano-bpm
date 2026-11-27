@@ -429,6 +429,7 @@ fn command_of(op: &str) -> (&'static str, &'static str) {
         "failJob" => ("JOB", "FAIL"),
         "completeUserTask" => ("USER_TASK", "COMPLETE"),
         "publishMessage" => ("MESSAGE", "PUBLISH"),
+        "broadcastSignal" => ("SIGNAL", "BROADCAST"),
         "resolveIncident" => ("INCIDENT", "RESOLVE"),
         "updateVariables" => ("VARIABLE_DOCUMENT", "UPDATE"),
         "cancelInstance" => ("PROCESS_INSTANCE", "CANCEL"),
@@ -631,6 +632,13 @@ impl<'a> NanoRun<'a> {
                 let name = step["name"].as_str().expect("name");
                 let ck = step["correlationKey"].as_str().expect("correlationKey");
                 self.apply(Command::correlate_message_with(name, ck, vars))
+            }
+            "broadcastSignal" => {
+                let name = step["name"].as_str().expect("name");
+                self.apply(Command::BroadcastSignal {
+                    signal_name: name.to_string(),
+                    variables: vars,
+                })
             }
             "advanceClock" => {
                 self.now += step["millis"].as_u64().expect("millis");

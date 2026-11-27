@@ -1,0 +1,72 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI" xmlns:dc="http://www.omg.org/spec/DD/20100524/DC" xmlns:di="http://www.omg.org/spec/DD/20100524/DI" xmlns:zeebe="http://camunda.org/schema/zeebe/1.0" id="defs-evt-gateway-timer" targetNamespace="http://nanobpm.io/traces">
+  <bpmn:message id="msg-go" name="go">
+    <bpmn:extensionElements>
+      <zeebe:subscription correlationKey="=orderId" />
+    </bpmn:extensionElements>
+  </bpmn:message>
+  <bpmn:signal id="sig-go" name="sig-go" />
+  <bpmn:process id="evt-gateway-timer" isExecutable="true">
+    <bpmn:startEvent id="start">
+      <bpmn:outgoing>f-start</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:sequenceFlow id="f-start" sourceRef="start" targetRef="gw" />
+    <bpmn:eventBasedGateway id="gw">
+      <bpmn:incoming>f-start</bpmn:incoming>
+      <bpmn:outgoing>f-msg</bpmn:outgoing>
+      <bpmn:outgoing>f-timer</bpmn:outgoing>
+      <bpmn:outgoing>f-sig</bpmn:outgoing>
+    </bpmn:eventBasedGateway>
+    <bpmn:sequenceFlow id="f-msg" sourceRef="gw" targetRef="onMsg" />
+    <bpmn:sequenceFlow id="f-timer" sourceRef="gw" targetRef="onTimer" />
+    <bpmn:sequenceFlow id="f-sig" sourceRef="gw" targetRef="onSig" />
+    <bpmn:intermediateCatchEvent id="onMsg">
+      <bpmn:incoming>f-msg</bpmn:incoming>
+      <bpmn:outgoing>f-msg-end</bpmn:outgoing>
+      <bpmn:messageEventDefinition id="med" messageRef="msg-go" />
+    </bpmn:intermediateCatchEvent>
+    <bpmn:intermediateCatchEvent id="onTimer">
+      <bpmn:incoming>f-timer</bpmn:incoming>
+      <bpmn:outgoing>f-timer-end</bpmn:outgoing>
+      <bpmn:timerEventDefinition id="ted">
+        <bpmn:timeDuration>PT1M</bpmn:timeDuration>
+      </bpmn:timerEventDefinition>
+    </bpmn:intermediateCatchEvent>
+    <bpmn:intermediateCatchEvent id="onSig">
+      <bpmn:incoming>f-sig</bpmn:incoming>
+      <bpmn:outgoing>f-sig-end</bpmn:outgoing>
+      <bpmn:signalEventDefinition id="sed" signalRef="sig-go" />
+    </bpmn:intermediateCatchEvent>
+    <bpmn:sequenceFlow id="f-msg-end" sourceRef="onMsg" targetRef="endMsg" />
+    <bpmn:sequenceFlow id="f-timer-end" sourceRef="onTimer" targetRef="endTimer" />
+    <bpmn:sequenceFlow id="f-sig-end" sourceRef="onSig" targetRef="endSig" />
+    <bpmn:endEvent id="endMsg">
+      <bpmn:incoming>f-msg-end</bpmn:incoming>
+    </bpmn:endEvent>
+    <bpmn:endEvent id="endTimer">
+      <bpmn:incoming>f-timer-end</bpmn:incoming>
+    </bpmn:endEvent>
+    <bpmn:endEvent id="endSig">
+      <bpmn:incoming>f-sig-end</bpmn:incoming>
+    </bpmn:endEvent>
+  </bpmn:process>
+  <bpmndi:BPMNDiagram id="diagram">
+    <bpmndi:BPMNPlane id="plane" bpmnElement="evt-gateway-timer">
+      <bpmndi:BPMNShape id="start_di" bpmnElement="start"><dc:Bounds x="100" y="202" width="36" height="36" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="gw_di" bpmnElement="gw"><dc:Bounds x="190" y="195" width="50" height="50" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="onMsg_di" bpmnElement="onMsg"><dc:Bounds x="300" y="102" width="36" height="36" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="onTimer_di" bpmnElement="onTimer"><dc:Bounds x="300" y="202" width="36" height="36" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="onSig_di" bpmnElement="onSig"><dc:Bounds x="300" y="302" width="36" height="36" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="endMsg_di" bpmnElement="endMsg"><dc:Bounds x="400" y="102" width="36" height="36" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="endTimer_di" bpmnElement="endTimer"><dc:Bounds x="400" y="202" width="36" height="36" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="endSig_di" bpmnElement="endSig"><dc:Bounds x="400" y="302" width="36" height="36" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="f-start_di" bpmnElement="f-start"><di:waypoint x="136" y="220" /><di:waypoint x="190" y="220" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f-msg_di" bpmnElement="f-msg"><di:waypoint x="215" y="195" /><di:waypoint x="215" y="120" /><di:waypoint x="300" y="120" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f-timer_di" bpmnElement="f-timer"><di:waypoint x="240" y="220" /><di:waypoint x="300" y="220" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f-sig_di" bpmnElement="f-sig"><di:waypoint x="215" y="245" /><di:waypoint x="215" y="320" /><di:waypoint x="300" y="320" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f-msg-end_di" bpmnElement="f-msg-end"><di:waypoint x="336" y="120" /><di:waypoint x="400" y="120" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f-timer-end_di" bpmnElement="f-timer-end"><di:waypoint x="336" y="220" /><di:waypoint x="400" y="220" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f-sig-end_di" bpmnElement="f-sig-end"><di:waypoint x="336" y="320" /><di:waypoint x="400" y="320" /></bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+</bpmn:definitions>

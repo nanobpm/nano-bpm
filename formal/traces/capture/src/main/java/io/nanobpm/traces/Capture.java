@@ -327,6 +327,11 @@ public final class Capture {
                   .withVariables(vars);
           (reject ? c.expectRejection() : c).publish();
         }
+        case "broadcastSignal" -> {
+          final var c =
+              engine.signal().withSignalName(step.get("name").asText()).withVariables(vars);
+          (reject ? c.expectRejection() : c).broadcast();
+        }
         case "advanceClock" -> engine.increaseTime(Duration.ofMillis(step.get("millis").asLong()));
         case "resolveIncident" -> {
           final var c =

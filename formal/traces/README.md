@@ -42,6 +42,7 @@ one of the following:
 | `failJob` | `jobType`, `retries`, `errorMessage?` | JOB FAIL |
 | `completeUserTask` | `elementId`, `variables?` | USER_TASK COMPLETE |
 | `publishMessage` | `name`, `correlationKey`, `variables?` | MESSAGE PUBLISH |
+| `broadcastSignal` | `name`, `variables?` | SIGNAL BROADCAST |
 | `advanceClock` | `millis` | clock advance, then fire any due timers |
 | `resolveIncident` | `elementId` | INCIDENT RESOLVE |
 | `updateVariables` | `variables` | VARIABLE_DOCUMENT UPDATE on the process instance |
