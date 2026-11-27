@@ -213,4 +213,7 @@ test("HTML comments are stripped from prose but kept in code (generated-block ma
   assert.match(content, /&lt;!-- keep-fenced --&gt;/);
   assert.match(content, /<pre><code>&lt;!-- keep-indented --&gt;/);
   assert.doesNotMatch(content, /list continuation note/);
+  assert.match(content, /&lt;!-- keep-quoted --&gt;/);
+  assert.match(content, /&lt;!-- keep-list-fence --&gt;/);
+  assert.match(content, /<code>&lt;!-- keep-\swrapped --&gt;<\/code>/);
 });

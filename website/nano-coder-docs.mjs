@@ -175,76 +175,69 @@ function escapesRoot(base, path) {
 
 // Strip HTML comments (generated-block markers, contributor notes) from prose
 // before rendering: the shared renderer runs with `html: false`, so a comment
-// would otherwise be published as visible text. Fenced code blocks and inline
-// code spans are left verbatim, so a literal `<!-- -->` in an example survives.
-// Indented code blocks (4+ spaces / tab after a blank line, outside a list) are
-// verbatim too; an indented line after a blank line within a list is a list
-// continuation paragraph, so it is still scanned.
-const LIST_ITEM = /^ {0,3}([-*+]|\d{1,9}[.)])(\s|$)/;
-export function stripDocComments(body) {
+// would otherwise be published as visible text. Code regions are left verbatim,
+// so a literal `<!-- -->` in an example survives. Block code (fenced or
+// indented, at any nesting — blockquotes, lists) is located by the renderer's
+// own parser (`md`), not by a hand-rolled line scanner, so every shape the
+// renderer treats as code is protected. Inline code spans, including ones that
+// wrap across lines, are skipped by the prose scanner.
+export function stripDocComments(body, md) {
+  const lines = body.split("\n");
+  const code = new Array(lines.length).fill(false);
+  for (const t of md.parse(body, {})) {
+    if ((t.type === "fence" || t.type === "code_block") && t.map) {
+      for (let l = t.map[0]; l < t.map[1] && l < lines.length; l++) code[l] = true;
+    }
+  }
   const out = [];
-  let fence = null; // { ch, len } of the open fence
   let inComment = false;
-  let prevBlank = true; // start of document behaves like after a blank line
-  let inList = false;
-  let inIndented = false;
-  for (const line of body.split("\n")) {
-    const blank = line.trim() === "";
-    const indented = /^( {4}|\t)/.test(line);
-    if (!inComment && !fence) {
-      if (inIndented && (indented || blank)) {
-        out.push(line);
-        prevBlank = blank;
-        continue;
-      }
-      inIndented = false;
-      if (indented && prevBlank && !inList) {
-        inIndented = true;
-        out.push(line);
-        prevBlank = false;
-        continue;
-      }
-      if (!blank && !indented) inList = LIST_ITEM.test(line) || (inList && !prevBlank);
-    }
-    prevBlank = blank;
-    if (!inComment) {
-      const f = /^ {0,3}(`{3,}|~{3,})/.exec(line);
-      if (fence) {
-        if (f && f[1][0] === fence.ch && f[1].length >= fence.len && /^ {0,3}[`~]+\s*$/.test(line)) fence = null;
-        out.push(line);
-        continue;
-      }
-      if (f) {
-        fence = { ch: f[1][0], len: f[1].length };
-        out.push(line);
-        continue;
-      }
-    }
+  let l = 0;
+  while (l < lines.length) {
+    if (code[l]) { out.push(lines[l]); l++; continue; }
+    // A run of prose lines, scanned as one string so code spans and comments
+    // may wrap across lines; results are split back per source line.
+    let e = l;
+    while (e < lines.length && !code[e]) e++;
+    const src = lines.slice(l, e).join("\n");
     let res = "";
     let i = 0;
-    while (i < line.length) {
+    while (i < src.length) {
       if (inComment) {
-        const end = line.indexOf("-->", i);
-        if (end < 0) { i = line.length; break; }
-        inComment = false;
-        i = end + 3;
+        const end = src.indexOf("-->", i);
+        // Keep the newlines a comment swallows, so the line mapping holds.
+        const stop = end < 0 ? src.length : end + 3;
+        res += src.slice(i, stop).replace(/[^\n]/g, "");
+        if (end >= 0) inComment = false;
+        i = stop;
         continue;
       }
-      if (line[i] === "`") {
+      if (src[i] === "`") {
         let n = 1;
-        while (line[i + n] === "`") n++;
+        while (src[i + n] === "`") n++;
         const tick = "`".repeat(n);
-        let j = line.indexOf(tick, i + n);
-        while (j >= 0 && line[j + n] === "`") j = line.indexOf(tick, j + n + 1);
-        if (j >= 0) { res += line.slice(i, j + n); i = j + n; continue; }
+        // A code span ends at the next run of exactly n backticks within the
+        // same paragraph (a blank line ends a paragraph).
+        const para = src.slice(i + n).search(/\n[ \t]*\n/);
+        const limit = para < 0 ? src.length : i + n + para;
+        let j = src.indexOf(tick, i + n);
+        while (j >= 0 && j < limit && src[j + n] === "`") {
+          let k = j;
+          while (src[k] === "`") k++;
+          j = src.indexOf(tick, k);
+        }
+        if (j >= 0 && j < limit) { res += src.slice(i, j + n); i = j + n; continue; }
         res += tick; i += n; continue;
       }
-      if (line.startsWith("<!--", i)) { inComment = true; i += 4; continue; }
-      res += line[i]; i++;
+      if (src.startsWith("<!--", i)) { inComment = true; i += 4; continue; }
+      res += src[i]; i++;
     }
-    // Drop lines that held only a comment, so markers don't leave blank gaps.
-    if (res.trim() === "" && line.trim() !== "") continue;
-    out.push(res);
+    const resLines = res.split("\n");
+    for (let k = 0; k < resLines.length; k++) {
+      // Drop lines that held only a comment, so markers don't leave blank gaps.
+      if (resLines[k].trim() === "" && lines[l + k].trim() !== "") continue;
+      out.push(resLines[k]);
+    }
+    l = e;
   }
   return out.join("\n");
 }
@@ -301,7 +294,7 @@ function sidebarHtml(sections, activeRoute) {
 
 function pageHtml(page, ctx, md) {
   const env = { fromPath: page.path };
-  const tokens = md.parse(stripDocComments(page.body), env);
+  const tokens = md.parse(stripDocComments(page.body, md), env);
   const toc = tocFromTokens(tokens);
   // Visible "#" anchor on each H2/H3 (heading ids are set by the shared renderer).
   let body = md.renderer.render(tokens, md.options, env);

@@ -29,3 +29,18 @@ Indented code block:
 - list item
 
     <!-- list continuation note -->
+
+> Quoted example:
+>
+> ```html
+> <!-- keep-quoted -->
+> ```
+
+- list with a fence:
+
+    ```html
+    <!-- keep-list-fence -->
+    ```
+
+A wrapped code span `<!-- keep-
+wrapped -->` survives.
