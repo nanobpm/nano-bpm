@@ -34,33 +34,24 @@ mkdir -p "$repo/target"
 work="$(mktemp -d "$repo/target/parity-zeebe.XXXXXX")"
 trap 'docker rm -f parity-camunda >/dev/null 2>&1 || true; rm -rf "$work"' EXIT
 
-sha256() {
-  if command -v sha256sum >/dev/null; then sha256sum "$1" | cut -d' ' -f1
-  else shasum -a 256 "$1" | cut -d' ' -f1; fi
-}
+# shellcheck source=fetch-pinned.sh
+source "$here/fetch-pinned.sh"
 
-# fetch_pinned <url> <dest> <sha256>: reuse a cached jar that verifies, else
-# download (curl --retry on the FETCH of an immutable artifact — not a test
-# retry) and verify before it enters the cache, so a bad download is never kept.
-fetch_pinned() {
-  local url="$1" dest="$2" want="$3"
-  if [[ -f "$dest" && "$(sha256 "$dest")" == "$want" ]]; then return; fi
-  rm -f "$dest"
-  echo "fetching $url"
-  curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 --connect-timeout 20 -o "$dest.tmp" "$url"
-  if [[ "$(sha256 "$dest.tmp")" != "$want" ]]; then
-    rm -f "$dest.tmp"
-    echo "error: $url does not match the pinned SHA-256" >&2
-    exit 1
-  fi
-  mv "$dest.tmp" "$dest"
-}
-
-base="https://repo1.maven.org/maven2/org/jacoco"
+# Maven Central first, then Google's Central mirror (same bytes; the SHA-256
+# pin makes any mirror safe). The workflow restores/saves the cache dir, so a
+# PR run normally makes no request at all (#2079).
+mirrors=(https://repo1.maven.org/maven2 https://maven-central.storage-download.googleapis.com/maven2)
 cache="${JACOCO_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/nanobpm-jacoco/$JACOCO_VERSION}"
 mkdir -p "$cache" "$work/jacoco"
-fetch_pinned "$base/org.jacoco.agent/$JACOCO_VERSION/org.jacoco.agent-$JACOCO_VERSION-runtime.jar" "$cache/jacocoagent.jar" "$JACOCO_AGENT_SHA256"
-fetch_pinned "$base/org.jacoco.cli/$JACOCO_VERSION/org.jacoco.cli-$JACOCO_VERSION-nodeps.jar" "$cache/jacococli.jar" "$JACOCO_CLI_SHA256"
+agent_path="org/jacoco/org.jacoco.agent/$JACOCO_VERSION/org.jacoco.agent-$JACOCO_VERSION-runtime.jar"
+cli_path="org/jacoco/org.jacoco.cli/$JACOCO_VERSION/org.jacoco.cli-$JACOCO_VERSION-nodeps.jar"
+agent_urls=() cli_urls=()
+for m in "${mirrors[@]}"; do agent_urls+=("$m/$agent_path"); cli_urls+=("$m/$cli_path"); done
+fetch_pinned "org.jacoco.agent-$JACOCO_VERSION-runtime.jar" "$cache/jacocoagent.jar" "$JACOCO_AGENT_SHA256" "${agent_urls[@]}"
+fetch_pinned "org.jacoco.cli-$JACOCO_VERSION-nodeps.jar" "$cache/jacococli.jar" "$JACOCO_CLI_SHA256" "${cli_urls[@]}"
+# --fetch-only: populate the cache and stop (the workflow saves it right away,
+# so a later failure in the measurement cannot lose it).
+if [[ "${JACOCO_FETCH_ONLY:-}" == 1 ]]; then echo "JaCoCo jars cached in $cache"; exit 0; fi
 # Copy (not mount) the agent: /jacoco is bind-mounted and written by the container.
 cp "$cache/jacocoagent.jar" "$work/jacoco/jacocoagent.jar"
 cp "$cache/jacococli.jar" "$work/jacococli.jar"
