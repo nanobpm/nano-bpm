@@ -6217,22 +6217,28 @@ impl AsRef<ServerImpl> for ServerImpl {
     }
 }
 
-/// Maps a peer-forward transport failure for a job command (#1931) to a
-/// retryable "Service unavailable" problem via `unavailable`, logging it on the
-/// forwarding node (target node, job key) so the failure is observable. The
-/// status comes from the canonical [`PeerError::http_status`] mapping.
+/// Maps a peer-forward transport failure for a job command to its problem
+/// response, logging it on the forwarding node (target node, job key) so the
+/// failure is observable. The status comes from the canonical
+/// [`PeerError::command_http_status`] mapping: a pre-send failure is the
+/// retryable 503 via `unavailable` (#1931); a post-send failure has an unknown
+/// outcome (the owner may have applied it) and is the 504 via `timeout`
+/// (#2093) — a 503 there makes HTTP clients auto-retry an applied command.
 fn peer_transport_failure<R>(
     node: u32,
     job_key: u64,
     e: &nano_server_raft::peer::PeerError,
     unavailable: impl FnOnce(models::ProblemDetail) -> R,
+    timeout: impl FnOnce(models::ProblemDetail) -> R,
 ) -> R {
-    tracing::warn!(node, job_key, error = %e, "job command forward to peer failed; returning retryable 503");
-    unavailable(problem(
-        "Service unavailable",
-        e.http_status(),
-        e.to_string(),
-    ))
+    let status = e.command_http_status();
+    if status == 504 {
+        tracing::warn!(node, job_key, error = %e, "job command forward to peer has unknown outcome; returning 504");
+        timeout(problem("Gateway timeout", status, e.to_string()))
+    } else {
+        tracing::warn!(node, job_key, error = %e, "job command forward to peer failed; returning retryable 503");
+        unavailable(problem("Service unavailable", status, e.to_string()))
+    }
 }
 
 fn problem(title: &str, status: u16, detail: String) -> models::ProblemDetail {
@@ -13561,6 +13567,9 @@ impl ServerImpl {
                         (409, Some(p.detail))
                     }
                     Ok(R::Status503_TheServiceIsCurrentlyUnavailable(p)) => (503, Some(p.detail)),
+                    Ok(R::Status504_TheRequestTimedOutBetweenTheGatewayAndTheBroker(p)) => {
+                        (504, Some(p.detail))
+                    }
                     Ok(R::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(p)) => {
                         (500, Some(p.detail))
                     }
@@ -13586,6 +13595,9 @@ impl ServerImpl {
                         (409, Some(p.detail))
                     }
                     Ok(R::Status503_TheServiceIsCurrentlyUnavailable(p)) => (503, Some(p.detail)),
+                    Ok(R::Status504_TheRequestTimedOutBetweenTheGatewayAndTheBroker(p)) => {
+                        (504, Some(p.detail))
+                    }
                     Ok(R::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(p)) => {
                         (500, Some(p.detail))
                     }
@@ -13604,6 +13616,9 @@ impl ServerImpl {
                         (409, Some(p.detail))
                     }
                     Ok(R::Status503_TheServiceIsCurrentlyUnavailable(p)) => (503, Some(p.detail)),
+                    Ok(R::Status504_TheRequestTimedOutBetweenTheGatewayAndTheBroker(p)) => {
+                        (504, Some(p.detail))
+                    }
                     Ok(R::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(p)) => {
                         (500, Some(p.detail))
                     }
@@ -13629,6 +13644,9 @@ impl ServerImpl {
                         (409, Some(p.detail))
                     }
                     Ok(R::Status503_TheServiceIsCurrentlyUnavailable(p)) => (503, Some(p.detail)),
+                    Ok(R::Status504_TheRequestTimedOutBetweenTheGatewayAndTheBroker(p)) => {
+                        (504, Some(p.detail))
+                    }
                     Ok(R::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(p)) => {
                         (500, Some(p.detail))
                     }
@@ -13660,7 +13678,10 @@ impl ServerImpl {
                         .and_then(|v| v.as_str().map(|s| s.to_string()))
                         .unwrap_or_default(),
                 ),
-                Err(e) => (e.http_status(), e.to_string()),
+                // A post-send failure has an unknown outcome (the owner may
+                // have applied the mutation): 504, not the auto-retried 503
+                // (#2093). Pre-send failures stay the retryable 503.
+                Err(e) => (e.command_http_status(), e.to_string()),
             },
             Err((s, m)) => (s, m),
         }
@@ -13884,14 +13905,26 @@ impl ServerImpl {
                 503,
                 peer_detail(&r),
             )),
+            // A re-forwarding owner (leadership change) whose own downstream
+            // outcome is unknown answers 504: relay it intact, never as 500
+            // (#2093 review).
+            Ok(r) if r.status == 504 => {
+                Resp::Status504_TheJobCommandWasForwardedToThePartitionOwnerButNoReplyArrivedInTime(
+                    problem("Gateway timeout", 504, peer_detail(&r)),
+                )
+            }
             Ok(r) => Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
                 "Peer error",
                 500,
                 peer_detail(&r),
             )),
-            Err(e) => peer_transport_failure(node, job_key, &e, |p| {
-                Resp::Status503_TheServiceIsCurrentlyUnavailable(p)
-            }),
+            Err(e) => peer_transport_failure(
+                node,
+                job_key,
+                &e,
+                Resp::Status503_TheServiceIsCurrentlyUnavailable,
+                Resp::Status504_TheJobCommandWasForwardedToThePartitionOwnerButNoReplyArrivedInTime,
+            ),
         }
     }
 
@@ -13948,14 +13981,26 @@ impl ServerImpl {
                 503,
                 peer_detail(&r),
             )),
+            // A re-forwarding owner (leadership change) whose own downstream
+            // outcome is unknown answers 504: relay it intact, never as 500
+            // (#2093 review).
+            Ok(r) if r.status == 504 => {
+                Resp::Status504_TheJobCommandWasForwardedToThePartitionOwnerButNoReplyArrivedInTime(
+                    problem("Gateway timeout", 504, peer_detail(&r)),
+                )
+            }
             Ok(r) => Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
                 "Peer error",
                 500,
                 peer_detail(&r),
             )),
-            Err(e) => peer_transport_failure(node, job_key, &e, |p| {
-                Resp::Status503_TheServiceIsCurrentlyUnavailable(p)
-            }),
+            Err(e) => peer_transport_failure(
+                node,
+                job_key,
+                &e,
+                Resp::Status503_TheServiceIsCurrentlyUnavailable,
+                Resp::Status504_TheJobCommandWasForwardedToThePartitionOwnerButNoReplyArrivedInTime,
+            ),
         }
     }
 
@@ -14021,14 +14066,26 @@ impl ServerImpl {
                 503,
                 peer_detail(&r),
             )),
+            // A re-forwarding owner (leadership change) whose own downstream
+            // outcome is unknown answers 504: relay it intact, never as 500
+            // (#2093 review).
+            Ok(r) if r.status == 504 => {
+                Resp::Status504_TheJobCommandWasForwardedToThePartitionOwnerButNoReplyArrivedInTime(
+                    problem("Gateway timeout", 504, peer_detail(&r)),
+                )
+            }
             Ok(r) => Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
                 "Peer error",
                 500,
                 peer_detail(&r),
             )),
-            Err(e) => peer_transport_failure(node, job_key, &e, |p| {
-                Resp::Status503_TheServiceIsCurrentlyUnavailable(p)
-            }),
+            Err(e) => peer_transport_failure(
+                node,
+                job_key,
+                &e,
+                Resp::Status503_TheServiceIsCurrentlyUnavailable,
+                Resp::Status504_TheJobCommandWasForwardedToThePartitionOwnerButNoReplyArrivedInTime,
+            ),
         }
     }
 
@@ -14064,7 +14121,7 @@ impl ServerImpl {
             {
                 Ok(r) => (r.status, r.body),
                 Err(e) => (
-                    e.http_status(),
+                    e.command_http_status(),
                     Some(serde_json::Value::String(e.to_string())),
                 ),
             },
@@ -14096,7 +14153,7 @@ impl ServerImpl {
             {
                 Ok(r) => (r.status, r.body),
                 Err(e) => (
-                    e.http_status(),
+                    e.command_http_status(),
                     Some(serde_json::Value::String(e.to_string())),
                 ),
             },
@@ -14128,7 +14185,7 @@ impl ServerImpl {
             {
                 Ok(r) => (r.status, r.body),
                 Err(e) => (
-                    e.http_status(),
+                    e.command_http_status(),
                     Some(serde_json::Value::String(e.to_string())),
                 ),
             },
@@ -17583,6 +17640,11 @@ impl ServerImpl {
                     503,
                     detail,
                 )),
+                504 => Resp::Status504_TheRequestTimedOutBetweenTheGatewayAndTheBroker(problem(
+                    "Gateway timeout",
+                    504,
+                    detail,
+                )),
                 s => Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
                     "Peer error",
                     500,
@@ -17674,6 +17736,11 @@ impl ServerImpl {
                 503 => Resp::Status503_TheServiceIsCurrentlyUnavailable(problem(
                     "Service unavailable",
                     503,
+                    detail,
+                )),
+                504 => Resp::Status504_TheRequestTimedOutBetweenTheGatewayAndTheBroker(problem(
+                    "Gateway timeout",
+                    504,
                     detail,
                 )),
                 s => Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
@@ -18007,6 +18074,11 @@ impl ServerImpl {
                     503,
                     detail,
                 )),
+                504 => Resp::Status504_TheRequestTimedOutBetweenTheGatewayAndTheBroker(problem(
+                    "Gateway timeout",
+                    504,
+                    detail,
+                )),
                 s => Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
                     "Peer error",
                     500,
@@ -18094,6 +18166,11 @@ impl ServerImpl {
                 503 => Resp::Status503_TheServiceIsCurrentlyUnavailable(problem(
                     "Service unavailable",
                     503,
+                    detail,
+                )),
+                504 => Resp::Status504_TheRequestTimedOutBetweenTheGatewayAndTheBroker(problem(
+                    "Gateway timeout",
+                    504,
                     detail,
                 )),
                 s => Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
@@ -43365,6 +43442,14 @@ mod clustered_startup_tests {
     /// the socket as soon as a request frame arrives, without replying — an
     /// established link failing post-send (outcome unknown).
     async fn spawn_mute_owner() -> std::net::SocketAddr {
+        spawn_scripted_owner(None).await
+    }
+
+    /// A peer owner that accepts the cluster link and, when `reply` is set,
+    /// answers every correlated request with a `CommandResult` of that status
+    /// (e.g. 504 from a re-forwarding owner whose own downstream outcome is
+    /// unknown); when `None` it drops the link mid-request (mute owner).
+    async fn spawn_scripted_owner(reply: Option<u16>) -> std::net::SocketAddr {
         use nano_falcon_protocol::cluster_join as cj;
         use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
         use tokio_tungstenite::tungstenite::http::HeaderValue;
@@ -43396,10 +43481,35 @@ mod clustered_startup_tests {
                     };
                     if let Ok(mut ws) = tokio_tungstenite::accept_hdr_async(stream, callback).await
                     {
-                        use futures_util::StreamExt as _;
+                        use futures_util::{SinkExt as _, StreamExt as _};
                         while let Some(Ok(m)) = ws.next().await {
-                            if m.is_text() || m.is_binary() {
+                            if !(m.is_text() || m.is_binary()) {
+                                continue;
+                            }
+                            let Some(status) = reply else {
                                 break; // drop the link mid-request
+                            };
+                            let corr = m
+                                .to_text()
+                                .ok()
+                                .and_then(|t| serde_json::from_str::<serde_json::Value>(t).ok())
+                                .and_then(|v| v.get("corr").and_then(|c| c.as_u64()));
+                            if let Some(corr) = corr {
+                                let frame = nano_falcon_protocol::ServerFrame::CommandResult {
+                                    corr,
+                                    status,
+                                    body: Some(serde_json::Value::String(
+                                        "downstream outcome unknown".into(),
+                                    )),
+                                };
+                                let txt = serde_json::to_string(&frame).expect("frame");
+                                if ws
+                                    .send(tokio_tungstenite::tungstenite::Message::Text(txt.into()))
+                                    .await
+                                    .is_err()
+                                {
+                                    break;
+                                }
                             }
                         }
                     }
@@ -43462,12 +43572,140 @@ mod clustered_startup_tests {
         );
     }
 
-    /// #1931 review: a peer that ACCEPTS the link but closes it before replying
-    /// (an established connection failing post-send) must surface the job
-    /// forwards as a retryable 503 — exercising the post-connection `Err` arms,
-    /// not the connect-failure branch.
+    /// #2093 review: a re-forwarding owner (leadership change) whose own
+    /// downstream outcome is unknown answers 504. Every forwarding adapter —
+    /// the job forwards (REST + stream) and the user-task forwarded-apply
+    /// adapter — must relay that typed 504 and its detail intact, never
+    /// collapse it into an untyped 500.
     #[tokio::test]
-    async fn job_command_forward_post_connect_failure_is_retryable_503() {
+    async fn forwarded_504_reply_is_relayed_not_collapsed_to_500() {
+        let node0 = clustered_node(0);
+        node0
+            .create_for_stream(Some("demo".into()), None, Default::default())
+            .await
+            .expect("owner creates the demo instance");
+        let jobs = node0
+            .activate_for_stream("demo-work", "w", 10, 60_000, None)
+            .await;
+        let job_key: u64 = jobs[0].job_key.0.parse().expect("numeric job key");
+
+        let addr = spawn_scripted_owner(Some(504)).await;
+        let topology = cluster::Topology {
+            node_id: 1,
+            peers: vec![format!("http://{addr}"), "http://unused".into()],
+            num_partitions: 4,
+            replication_factor: 1,
+        };
+        let journals: Vec<Journal> = topology
+            .local_partitions()
+            .iter()
+            .map(|p| Journal::in_memory_partition(*p))
+            .collect();
+        let node1 = build_server_in_memory(journals, topology);
+        let owner = node1.remote_owner_of(job_key).expect("peer-owned job");
+        let relayed = |d: &str| d.contains("downstream outcome unknown");
+
+        let complete = node1
+            .forward_complete_job(owner, job_key, JobCompletion::default())
+            .await;
+        assert!(
+            matches!(&complete, apis::job::CompleteJobResponse::Status504_TheJobCommandWasForwardedToThePartitionOwnerButNoReplyArrivedInTime(p) if p.status == 504 && relayed(&p.detail)),
+            "complete: {complete:?}"
+        );
+        let fail = node1
+            .forward_fail_job(owner, job_key, None, 0, String::new(), 0)
+            .await;
+        assert!(
+            matches!(&fail, apis::job::FailJobResponse::Status504_TheJobCommandWasForwardedToThePartitionOwnerButNoReplyArrivedInTime(p) if p.status == 504 && relayed(&p.detail)),
+            "fail: {fail:?}"
+        );
+        let throw = node1
+            .forward_throw_error(owner, job_key, None, "E".into(), String::new(), None)
+            .await;
+        assert!(
+            matches!(&throw, apis::job::ThrowJobErrorResponse::Status504_TheJobCommandWasForwardedToThePartitionOwnerButNoReplyArrivedInTime(p) if p.status == 504 && relayed(&p.detail)),
+            "throwError: {throw:?}"
+        );
+        let (status, _) = node1
+            .forward_complete_job_stream(owner, job_key, JobCompletion::default())
+            .await;
+        assert_eq!(status, 504, "stream complete");
+        let (status, _) = node1
+            .forward_fail_job_stream(owner, job_key, None, 0, String::new(), 0)
+            .await;
+        assert_eq!(status, 504, "stream fail");
+        let (status, _) = node1
+            .forward_throw_error_stream(owner, job_key, None, "E".into(), String::new(), None)
+            .await;
+        assert_eq!(status, 504, "stream throwError");
+
+        // The user-task forwarded-apply adapter: a key owned by the 504-answering
+        // peer, for every mutation op.
+        let key = job_key.to_string();
+        for (op, payload) in [
+            (crate::falcon::UserTaskOp::Complete, None),
+            (
+                crate::falcon::UserTaskOp::Assign,
+                Some(serde_json::json!({ "assignee": "a" })),
+            ),
+            (crate::falcon::UserTaskOp::Unassign, None),
+            (crate::falcon::UserTaskOp::Update, None),
+        ] {
+            let (status, detail) = node1.apply_user_task_forwarded(op, &key, payload).await;
+            assert_eq!(status, 504, "{op:?}: {detail:?}");
+            assert!(
+                detail.as_deref().is_some_and(relayed),
+                "{op:?} must keep the 504 detail: {detail:?}"
+            );
+        }
+    }
+
+    /// #2093 sibling: a user-task mutation (complete/assign/unassign/update)
+    /// forwarded to an owner that accepts the link but drops it before
+    /// replying has an unknown outcome, so it must be 504, never the
+    /// auto-retried 503. A connect failure (pre-send) stays the retryable 503.
+    #[tokio::test]
+    async fn user_task_forward_unknown_outcome_is_504_connect_failure_is_503() {
+        let addr = spawn_mute_owner().await;
+        let topology = cluster::Topology {
+            node_id: 1,
+            peers: vec![
+                format!("http://{addr}"),
+                "http://unused".into(),
+                "http://127.0.0.1:1".into(),
+            ],
+            num_partitions: 4,
+            replication_factor: 1,
+        };
+        let journals: Vec<Journal> = topology
+            .local_partitions()
+            .iter()
+            .map(|p| Journal::in_memory_partition(*p))
+            .collect();
+        let node1 = build_server_in_memory(journals, topology);
+        for op in [
+            crate::falcon::UserTaskOp::Complete,
+            crate::falcon::UserTaskOp::Assign,
+            crate::falcon::UserTaskOp::Unassign,
+            crate::falcon::UserTaskOp::Update,
+        ] {
+            let (status, detail) = node1.forward_user_task(0, op, 42, None).await;
+            assert_eq!(status, 504, "{op:?} post-send failure: {detail}");
+        }
+        let (status, detail) = node1
+            .forward_user_task(2, crate::falcon::UserTaskOp::Complete, 42, None)
+            .await;
+        assert_eq!(status, 503, "connect failure must stay retryable: {detail}");
+    }
+
+    /// #2093 (was #1931 review): a peer that ACCEPTS the link but closes it
+    /// before replying (an established connection failing post-send) leaves the
+    /// outcome unknown — the owner may have applied the command — so the job
+    /// forwards must surface as 504 Gateway Timeout, never the 503 that HTTP
+    /// clients auto-retry (a retried applied completion gets a spurious 404).
+    /// Exercises the post-connection `Err` arms, not the connect-failure branch.
+    #[tokio::test]
+    async fn job_command_forward_unknown_outcome_is_gateway_timeout_504() {
         let node0 = clustered_node(0);
         node0
             .create_for_stream(Some("demo".into()), None, Default::default())
@@ -43498,27 +43736,38 @@ mod clustered_startup_tests {
             .forward_complete_job(owner, job_key, JobCompletion::default())
             .await;
         assert!(
-            matches!(&complete, apis::job::CompleteJobResponse::Status503_TheServiceIsCurrentlyUnavailable(p) if p.status == 503 && !p.detail.contains("unreachable")),
-            "complete: post-connect failure must be a retryable 503 from the established link, got {complete:?}"
+            matches!(&complete, apis::job::CompleteJobResponse::Status504_TheJobCommandWasForwardedToThePartitionOwnerButNoReplyArrivedInTime(p) if p.status == 504 && !p.detail.contains("unreachable")),
+            "complete: post-connect failure must be a 504 (unknown outcome), not the auto-retried 503, got {complete:?}"
         );
         let fail = node1
             .forward_fail_job(owner, job_key, None, 0, String::new(), 0)
             .await;
         assert!(
-            matches!(&fail, apis::job::FailJobResponse::Status503_TheServiceIsCurrentlyUnavailable(p) if p.status == 503 && !p.detail.contains("unreachable")),
-            "fail: post-connect failure must be a retryable 503, got {fail:?}"
+            matches!(&fail, apis::job::FailJobResponse::Status504_TheJobCommandWasForwardedToThePartitionOwnerButNoReplyArrivedInTime(p) if p.status == 504 && !p.detail.contains("unreachable")),
+            "fail: post-connect failure must be a 504 (unknown outcome), got {fail:?}"
         );
         let throw = node1
             .forward_throw_error(owner, job_key, None, "E".into(), String::new(), None)
             .await;
         assert!(
-            matches!(&throw, apis::job::ThrowJobErrorResponse::Status503_TheServiceIsCurrentlyUnavailable(p) if p.status == 503 && !p.detail.contains("unreachable")),
-            "throwError: post-connect failure must be a retryable 503, got {throw:?}"
+            matches!(&throw, apis::job::ThrowJobErrorResponse::Status504_TheJobCommandWasForwardedToThePartitionOwnerButNoReplyArrivedInTime(p) if p.status == 504 && !p.detail.contains("unreachable")),
+            "throwError: post-connect failure must be a 504 (unknown outcome), got {throw:?}"
         );
         let (status, _) = node1
             .forward_complete_job_stream(owner, job_key, JobCompletion::default())
             .await;
-        assert_eq!(status, 503, "stream complete: post-connect failure is 503");
+        assert_eq!(status, 504, "stream complete: post-connect failure is 504");
+        let (status, _) = node1
+            .forward_fail_job_stream(owner, job_key, None, 0, String::new(), 0)
+            .await;
+        assert_eq!(status, 504, "stream fail: post-connect failure is 504");
+        let (status, _) = node1
+            .forward_throw_error_stream(owner, job_key, None, "E".into(), String::new(), None)
+            .await;
+        assert_eq!(
+            status, 504,
+            "stream throwError: post-connect failure is 504"
+        );
     }
 
     #[tokio::test]
