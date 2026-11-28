@@ -13666,7 +13666,10 @@ impl ServerImpl {
                         .and_then(|v| v.as_str().map(|s| s.to_string()))
                         .unwrap_or_default(),
                 ),
-                Err(e) => (e.http_status(), e.to_string()),
+                // A post-send failure has an unknown outcome (the owner may
+                // have applied the mutation): 504, not the auto-retried 503
+                // (#2093). Pre-send failures stay the retryable 503.
+                Err(e) => (e.command_http_status(), e.to_string()),
             },
             Err((s, m)) => (s, m),
         }
@@ -17601,6 +17604,11 @@ impl ServerImpl {
                     503,
                     detail,
                 )),
+                504 => Resp::Status504_TheRequestTimedOutBetweenTheGatewayAndTheBroker(problem(
+                    "Gateway timeout",
+                    504,
+                    detail,
+                )),
                 s => Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
                     "Peer error",
                     500,
@@ -17692,6 +17700,11 @@ impl ServerImpl {
                 503 => Resp::Status503_TheServiceIsCurrentlyUnavailable(problem(
                     "Service unavailable",
                     503,
+                    detail,
+                )),
+                504 => Resp::Status504_TheRequestTimedOutBetweenTheGatewayAndTheBroker(problem(
+                    "Gateway timeout",
+                    504,
                     detail,
                 )),
                 s => Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
@@ -18025,6 +18038,11 @@ impl ServerImpl {
                     503,
                     detail,
                 )),
+                504 => Resp::Status504_TheRequestTimedOutBetweenTheGatewayAndTheBroker(problem(
+                    "Gateway timeout",
+                    504,
+                    detail,
+                )),
                 s => Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
                     "Peer error",
                     500,
@@ -18112,6 +18130,11 @@ impl ServerImpl {
                 503 => Resp::Status503_TheServiceIsCurrentlyUnavailable(problem(
                     "Service unavailable",
                     503,
+                    detail,
+                )),
+                504 => Resp::Status504_TheRequestTimedOutBetweenTheGatewayAndTheBroker(problem(
+                    "Gateway timeout",
+                    504,
                     detail,
                 )),
                 s => Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
@@ -43478,6 +43501,44 @@ mod clustered_startup_tests {
             matches!(create(2).await, ForwardCreateOutcome::Unreachable(_)),
             "a connect failure must stay rerouteable (Unreachable)"
         );
+    }
+
+    /// #2093 sibling: a user-task mutation (complete/assign/unassign/update)
+    /// forwarded to an owner that accepts the link but drops it before
+    /// replying has an unknown outcome, so it must be 504, never the
+    /// auto-retried 503. A connect failure (pre-send) stays the retryable 503.
+    #[tokio::test]
+    async fn user_task_forward_unknown_outcome_is_504_connect_failure_is_503() {
+        let addr = spawn_mute_owner().await;
+        let topology = cluster::Topology {
+            node_id: 1,
+            peers: vec![
+                format!("http://{addr}"),
+                "http://unused".into(),
+                "http://127.0.0.1:1".into(),
+            ],
+            num_partitions: 4,
+            replication_factor: 1,
+        };
+        let journals: Vec<Journal> = topology
+            .local_partitions()
+            .iter()
+            .map(|p| Journal::in_memory_partition(*p))
+            .collect();
+        let node1 = build_server_in_memory(journals, topology);
+        for op in [
+            crate::falcon::UserTaskOp::Complete,
+            crate::falcon::UserTaskOp::Assign,
+            crate::falcon::UserTaskOp::Unassign,
+            crate::falcon::UserTaskOp::Update,
+        ] {
+            let (status, detail) = node1.forward_user_task(0, op, 42, None).await;
+            assert_eq!(status, 504, "{op:?} post-send failure: {detail}");
+        }
+        let (status, detail) = node1
+            .forward_user_task(2, crate::falcon::UserTaskOp::Complete, 42, None)
+            .await;
+        assert_eq!(status, 503, "connect failure must stay retryable: {detail}");
     }
 
     /// #2093 (was #1931 review): a peer that ACCEPTS the link but closes it
