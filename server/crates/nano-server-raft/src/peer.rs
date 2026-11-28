@@ -61,6 +61,11 @@ pub enum PeerError {
     Closed,
     /// No response within the request timeout.
     Timeout,
+    /// The request was never handed to the link: the lane was already down,
+    /// or outbound-queue admission failed or timed out. The owner cannot have
+    /// seen it, so the outcome is known (not applied) and a retry is safe
+    /// (#2093 review).
+    NotSent,
 }
 
 impl std::fmt::Display for PeerError {
@@ -69,6 +74,9 @@ impl std::fmt::Display for PeerError {
             PeerError::Connect(e) => write!(f, "peer connect failed: {e}"),
             PeerError::Closed => write!(f, "peer link closed before response"),
             PeerError::Timeout => write!(f, "peer request timed out"),
+            PeerError::NotSent => {
+                write!(f, "peer request not sent (lane down or queue unavailable)")
+            }
         }
     }
 }
@@ -86,7 +94,9 @@ impl PeerError {
     /// purpose: a new variant must make an explicit retryability decision.
     pub fn is_retryable(&self) -> bool {
         match self {
-            PeerError::Connect(_) | PeerError::Closed | PeerError::Timeout => true,
+            PeerError::Connect(_) | PeerError::Closed | PeerError::Timeout | PeerError::NotSent => {
+                true
+            }
         }
     }
 
@@ -101,11 +111,12 @@ impl PeerError {
 
     /// Whether the request may already have reached (and been applied by) the
     /// owner: a link that closed or timed out **after** the send leaves the
-    /// outcome unknown, while a connect failure is definitely pre-send.
-    /// Exhaustive on purpose.
+    /// outcome unknown, while a connect failure or a request that never
+    /// entered the outbound queue ([`PeerError::NotSent`]) is definitely
+    /// pre-send. Exhaustive on purpose.
     pub fn outcome_unknown(&self) -> bool {
         match self {
-            PeerError::Connect(_) => false,
+            PeerError::Connect(_) | PeerError::NotSent => false,
             PeerError::Closed | PeerError::Timeout => true,
         }
     }
@@ -640,7 +651,7 @@ impl PeerLink {
     {
         // Admission is gated on THIS lane's health only (#1582).
         if !lane_up.load(Ordering::Relaxed) {
-            return Err(PeerError::Closed);
+            return Err(PeerError::NotSent);
         }
         let corr = self.next_corr.fetch_add(1, Ordering::Relaxed);
         let frame = build(corr);
@@ -670,10 +681,12 @@ impl PeerLink {
         let sent =
             match tokio::time::timeout_at(deadline, out.send(Message::Text(txt.into()))).await {
                 Ok(sent) => sent,
-                Err(_) => return Err(PeerError::Timeout),
+                // Admission timed out: the frame never entered the queue.
+                Err(_) => return Err(PeerError::NotSent),
             };
         if sent.is_err() {
-            return Err(PeerError::Closed);
+            // The writer is gone: the frame was never queued.
+            return Err(PeerError::NotSent);
         }
 
         match tokio::time::timeout_at(deadline, rx).await {
@@ -2007,9 +2020,10 @@ mod write_status_tests {
             assert_eq!(e.write_http_status(false), 500, "{e}");
             assert_eq!(e.write_http_status(true), 503, "{e}");
         }
-        let c = PeerError::Connect("refused".into());
-        assert_eq!(c.write_http_status(false), 503);
-        assert_eq!(c.write_http_status(true), 503);
+        for c in [PeerError::Connect("refused".into()), PeerError::NotSent] {
+            assert_eq!(c.write_http_status(false), 503, "{c}");
+            assert_eq!(c.write_http_status(true), 503, "{c}");
+        }
     }
 
     /// #2093: a forwarded job command whose outcome is unknown (post-send
@@ -2024,6 +2038,9 @@ mod write_status_tests {
             PeerError::Connect("refused".into()).command_http_status(),
             503
         );
+        // A request that never entered the outbound queue (lane down,
+        // admission failed / timed out) was not applied: retryable 503.
+        assert_eq!(PeerError::NotSent.command_http_status(), 503);
     }
 }
 
@@ -2036,7 +2053,8 @@ mod tests {
     /// mark `nonRetryable` and drop, stranding jobs until their timeout).
     #[test]
     fn peer_error_mapping_is_retryable_for_transport_failures() {
-        let table: [(PeerError, bool, u16); 3] = [
+        let table: [(PeerError, bool, u16); 4] = [
+            (PeerError::NotSent, true, 503),
             (PeerError::Connect("refused".into()), true, 503),
             (PeerError::Closed, true, 503),
             (PeerError::Timeout, true, 503),
@@ -2144,8 +2162,8 @@ mod tests {
         let started = std::time::Instant::now();
         let second = link.request_within(Duration::from_millis(50), frame).await;
         assert!(
-            matches!(second, Err(PeerError::Timeout)),
-            "a full outbound queue must fail as Timeout, got {second:?}"
+            matches!(second, Err(PeerError::NotSent)),
+            "a full outbound queue must fail as NotSent (pre-send), got {second:?}"
         );
         assert!(
             started.elapsed() < Duration::from_secs(5),
