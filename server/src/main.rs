@@ -6217,22 +6217,28 @@ impl AsRef<ServerImpl> for ServerImpl {
     }
 }
 
-/// Maps a peer-forward transport failure for a job command (#1931) to a
-/// retryable "Service unavailable" problem via `unavailable`, logging it on the
-/// forwarding node (target node, job key) so the failure is observable. The
-/// status comes from the canonical [`PeerError::http_status`] mapping.
+/// Maps a peer-forward transport failure for a job command to its problem
+/// response, logging it on the forwarding node (target node, job key) so the
+/// failure is observable. The status comes from the canonical
+/// [`PeerError::command_http_status`] mapping: a pre-send failure is the
+/// retryable 503 via `unavailable` (#1931); a post-send failure has an unknown
+/// outcome (the owner may have applied it) and is the 504 via `timeout`
+/// (#2093) — a 503 there makes HTTP clients auto-retry an applied command.
 fn peer_transport_failure<R>(
     node: u32,
     job_key: u64,
     e: &nano_server_raft::peer::PeerError,
     unavailable: impl FnOnce(models::ProblemDetail) -> R,
+    timeout: impl FnOnce(models::ProblemDetail) -> R,
 ) -> R {
-    tracing::warn!(node, job_key, error = %e, "job command forward to peer failed; returning retryable 503");
-    unavailable(problem(
-        "Service unavailable",
-        e.http_status(),
-        e.to_string(),
-    ))
+    let status = e.command_http_status();
+    if status == 504 {
+        tracing::warn!(node, job_key, error = %e, "job command forward to peer has unknown outcome; returning 504");
+        timeout(problem("Gateway timeout", status, e.to_string()))
+    } else {
+        tracing::warn!(node, job_key, error = %e, "job command forward to peer failed; returning retryable 503");
+        unavailable(problem("Service unavailable", status, e.to_string()))
+    }
 }
 
 fn problem(title: &str, status: u16, detail: String) -> models::ProblemDetail {
@@ -13889,9 +13895,13 @@ impl ServerImpl {
                 500,
                 peer_detail(&r),
             )),
-            Err(e) => peer_transport_failure(node, job_key, &e, |p| {
-                Resp::Status503_TheServiceIsCurrentlyUnavailable(p)
-            }),
+            Err(e) => peer_transport_failure(
+                node,
+                job_key,
+                &e,
+                Resp::Status503_TheServiceIsCurrentlyUnavailable,
+                Resp::Status504_TheJobCommandWasForwardedToThePartitionOwnerButNoReplyArrivedInTime,
+            ),
         }
     }
 
@@ -13953,9 +13963,13 @@ impl ServerImpl {
                 500,
                 peer_detail(&r),
             )),
-            Err(e) => peer_transport_failure(node, job_key, &e, |p| {
-                Resp::Status503_TheServiceIsCurrentlyUnavailable(p)
-            }),
+            Err(e) => peer_transport_failure(
+                node,
+                job_key,
+                &e,
+                Resp::Status503_TheServiceIsCurrentlyUnavailable,
+                Resp::Status504_TheJobCommandWasForwardedToThePartitionOwnerButNoReplyArrivedInTime,
+            ),
         }
     }
 
@@ -14026,9 +14040,13 @@ impl ServerImpl {
                 500,
                 peer_detail(&r),
             )),
-            Err(e) => peer_transport_failure(node, job_key, &e, |p| {
-                Resp::Status503_TheServiceIsCurrentlyUnavailable(p)
-            }),
+            Err(e) => peer_transport_failure(
+                node,
+                job_key,
+                &e,
+                Resp::Status503_TheServiceIsCurrentlyUnavailable,
+                Resp::Status504_TheJobCommandWasForwardedToThePartitionOwnerButNoReplyArrivedInTime,
+            ),
         }
     }
 
@@ -14064,7 +14082,7 @@ impl ServerImpl {
             {
                 Ok(r) => (r.status, r.body),
                 Err(e) => (
-                    e.http_status(),
+                    e.command_http_status(),
                     Some(serde_json::Value::String(e.to_string())),
                 ),
             },
@@ -14096,7 +14114,7 @@ impl ServerImpl {
             {
                 Ok(r) => (r.status, r.body),
                 Err(e) => (
-                    e.http_status(),
+                    e.command_http_status(),
                     Some(serde_json::Value::String(e.to_string())),
                 ),
             },
@@ -14128,7 +14146,7 @@ impl ServerImpl {
             {
                 Ok(r) => (r.status, r.body),
                 Err(e) => (
-                    e.http_status(),
+                    e.command_http_status(),
                     Some(serde_json::Value::String(e.to_string())),
                 ),
             },
@@ -43462,12 +43480,14 @@ mod clustered_startup_tests {
         );
     }
 
-    /// #1931 review: a peer that ACCEPTS the link but closes it before replying
-    /// (an established connection failing post-send) must surface the job
-    /// forwards as a retryable 503 — exercising the post-connection `Err` arms,
-    /// not the connect-failure branch.
+    /// #2093 (was #1931 review): a peer that ACCEPTS the link but closes it
+    /// before replying (an established connection failing post-send) leaves the
+    /// outcome unknown — the owner may have applied the command — so the job
+    /// forwards must surface as 504 Gateway Timeout, never the 503 that HTTP
+    /// clients auto-retry (a retried applied completion gets a spurious 404).
+    /// Exercises the post-connection `Err` arms, not the connect-failure branch.
     #[tokio::test]
-    async fn job_command_forward_post_connect_failure_is_retryable_503() {
+    async fn job_command_forward_unknown_outcome_is_gateway_timeout_504() {
         let node0 = clustered_node(0);
         node0
             .create_for_stream(Some("demo".into()), None, Default::default())
@@ -43498,27 +43518,38 @@ mod clustered_startup_tests {
             .forward_complete_job(owner, job_key, JobCompletion::default())
             .await;
         assert!(
-            matches!(&complete, apis::job::CompleteJobResponse::Status503_TheServiceIsCurrentlyUnavailable(p) if p.status == 503 && !p.detail.contains("unreachable")),
-            "complete: post-connect failure must be a retryable 503 from the established link, got {complete:?}"
+            matches!(&complete, apis::job::CompleteJobResponse::Status504_TheJobCommandWasForwardedToThePartitionOwnerButNoReplyArrivedInTime(p) if p.status == 504 && !p.detail.contains("unreachable")),
+            "complete: post-connect failure must be a 504 (unknown outcome), not the auto-retried 503, got {complete:?}"
         );
         let fail = node1
             .forward_fail_job(owner, job_key, None, 0, String::new(), 0)
             .await;
         assert!(
-            matches!(&fail, apis::job::FailJobResponse::Status503_TheServiceIsCurrentlyUnavailable(p) if p.status == 503 && !p.detail.contains("unreachable")),
-            "fail: post-connect failure must be a retryable 503, got {fail:?}"
+            matches!(&fail, apis::job::FailJobResponse::Status504_TheJobCommandWasForwardedToThePartitionOwnerButNoReplyArrivedInTime(p) if p.status == 504 && !p.detail.contains("unreachable")),
+            "fail: post-connect failure must be a 504 (unknown outcome), got {fail:?}"
         );
         let throw = node1
             .forward_throw_error(owner, job_key, None, "E".into(), String::new(), None)
             .await;
         assert!(
-            matches!(&throw, apis::job::ThrowJobErrorResponse::Status503_TheServiceIsCurrentlyUnavailable(p) if p.status == 503 && !p.detail.contains("unreachable")),
-            "throwError: post-connect failure must be a retryable 503, got {throw:?}"
+            matches!(&throw, apis::job::ThrowJobErrorResponse::Status504_TheJobCommandWasForwardedToThePartitionOwnerButNoReplyArrivedInTime(p) if p.status == 504 && !p.detail.contains("unreachable")),
+            "throwError: post-connect failure must be a 504 (unknown outcome), got {throw:?}"
         );
         let (status, _) = node1
             .forward_complete_job_stream(owner, job_key, JobCompletion::default())
             .await;
-        assert_eq!(status, 503, "stream complete: post-connect failure is 503");
+        assert_eq!(status, 504, "stream complete: post-connect failure is 504");
+        let (status, _) = node1
+            .forward_fail_job_stream(owner, job_key, None, 0, String::new(), 0)
+            .await;
+        assert_eq!(status, 504, "stream fail: post-connect failure is 504");
+        let (status, _) = node1
+            .forward_throw_error_stream(owner, job_key, None, "E".into(), String::new(), None)
+            .await;
+        assert_eq!(
+            status, 504,
+            "stream throwError: post-connect failure is 504"
+        );
     }
 
     #[tokio::test]

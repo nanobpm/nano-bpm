@@ -308,3 +308,55 @@
         application/problem+json:
           schema:
             $ref: 'problem-detail.yaml#/components/schemas/ProblemDetail'
+
+# --- job commands: 504 for an unknown-outcome peer forward (#2093) -----------
+#
+# On a cluster, a job command (complete / fail / throwError) received by a
+# non-owner gateway is forwarded to the partition owner. When that forward
+# times out (or the link drops) AFTER the request was sent, the gateway cannot
+# know whether the owner applied the command. Zeebe maps the equivalent
+# gateway->broker timeout to DEADLINE_EXCEEDED, which its GatewayErrorMapper
+# turns into HTTP 504; 503 is reserved for "not applied, safe to retry".
+# Returning 503 here made HTTP clients (e.g. httpclient5's retry strategy in the
+# Camunda Java client) auto-retry a non-idempotent completion that had in fact
+# applied, and record a spurious 404 failure. Upstream's job response tables
+# omit 504, so it lives here rather than as an edit to the vendored spec/.
+- file: jobs.yaml
+  target: paths./jobs/{jobKey}/completion.post.responses
+  merge:
+    "504":
+      description: >
+        The job command was forwarded to the partition owner but no reply
+        arrived in time, so its outcome is unknown (it may have been applied).
+        Not safe to blindly retry: a retry of an applied command is rejected
+        (e.g. 404 for an already-completed job).
+      content:
+        application/problem+json:
+          schema:
+            $ref: 'problem-detail.yaml#/components/schemas/ProblemDetail'
+- file: jobs.yaml
+  target: paths./jobs/{jobKey}/failure.post.responses
+  merge:
+    "504":
+      description: >
+        The job command was forwarded to the partition owner but no reply
+        arrived in time, so its outcome is unknown (it may have been applied).
+        Not safe to blindly retry: a retry of an applied command is rejected
+        (e.g. 404 for an already-completed job).
+      content:
+        application/problem+json:
+          schema:
+            $ref: 'problem-detail.yaml#/components/schemas/ProblemDetail'
+- file: jobs.yaml
+  target: paths./jobs/{jobKey}/error.post.responses
+  merge:
+    "504":
+      description: >
+        The job command was forwarded to the partition owner but no reply
+        arrived in time, so its outcome is unknown (it may have been applied).
+        Not safe to blindly retry: a retry of an applied command is rejected
+        (e.g. 404 for an already-completed job).
+      content:
+        application/problem+json:
+          schema:
+            $ref: 'problem-detail.yaml#/components/schemas/ProblemDetail'

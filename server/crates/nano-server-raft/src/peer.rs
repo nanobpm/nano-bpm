@@ -110,6 +110,21 @@ impl PeerError {
         }
     }
 
+    /// The HTTP status for a failed forwarded **command** whose retry is not
+    /// idempotent (job complete / fail / throwError, #2093). A pre-send
+    /// failure was not applied, so it is the retryable 503. A post-send
+    /// failure (timeout, link dropped) has an unknown outcome — the owner may
+    /// have applied it — so it is 504 Gateway Timeout, Zeebe's mapping of a
+    /// gateway→broker `DEADLINE_EXCEEDED`. A 503 there makes HTTP clients
+    /// auto-retry an applied completion and record a spurious 404.
+    pub fn command_http_status(&self) -> u16 {
+        if self.outcome_unknown() {
+            504
+        } else {
+            self.http_status()
+        }
+    }
+
     /// The HTTP status for a failed **non-idempotent write** (e.g. an
     /// instance create): retrying an unknown-outcome write is only safe when
     /// the owner deduplicates it (`deduplicated`, e.g. a `businessId`).
@@ -1995,6 +2010,20 @@ mod write_status_tests {
         let c = PeerError::Connect("refused".into());
         assert_eq!(c.write_http_status(false), 503);
         assert_eq!(c.write_http_status(true), 503);
+    }
+
+    /// #2093: a forwarded job command whose outcome is unknown (post-send
+    /// timeout / link drop) is 504, never the auto-retried 503; a pre-send
+    /// connect failure was not applied and stays the retryable 503.
+    #[test]
+    fn unknown_outcome_command_is_gateway_timeout() {
+        for e in [PeerError::Closed, PeerError::Timeout] {
+            assert_eq!(e.command_http_status(), 504, "{e}");
+        }
+        assert_eq!(
+            PeerError::Connect("refused".into()).command_http_status(),
+            503
+        );
     }
 }
 
